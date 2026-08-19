@@ -9,7 +9,7 @@ use database::{
     validate_legacy_project, Database, LegacyProject, LibraryState, Project,
 };
 use inspection::{canonical_project_path, inspect_project_path};
-use recovery::{restore_database, validate_backup_file};
+use recovery::{restore_database, validate_backup_file, validate_library_connection};
 use serde::Serialize;
 use std::{
     fs,
@@ -18,6 +18,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -347,6 +348,56 @@ fn write_backup(database: &Database, path: &Path) -> Result<(), String> {
     database.with_connection(|connection| backup_database(connection, path))
 }
 
+fn restore_with_rollback<F>(
+    connection: &mut rusqlite::Connection,
+    source: &Path,
+    safety_path: &Path,
+    verify_restored: F,
+) -> Result<LibraryState, String>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<LibraryState, String>,
+{
+    let attempt = restore_database(connection, source).and_then(|_| verify_restored(connection));
+    match attempt {
+        Ok(library) => Ok(library),
+        Err(restore_error) => {
+            let rollback = restore_database(connection, safety_path)
+                .and_then(|_| validate_library_connection(connection).map(|_| ()));
+            if let Err(rollback_error) = rollback {
+                eprintln!("Launchpad restore rollback failed: {rollback_error}");
+                return Err(
+                    "Restore failed and Launchpad could not automatically roll back. Keep the safety backup and restart Launchpad."
+                        .to_string(),
+                );
+            }
+            Err(restore_error)
+        }
+    }
+}
+
+fn restore_library_from_path(
+    database: &Database,
+    source: &Path,
+    safety_path: &Path,
+) -> Result<LibraryState, String> {
+    validate_backup_file(source)?;
+    if let Some(parent) = safety_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
+    }
+
+    database.with_connection(|connection| {
+        backup_database(connection, safety_path)?;
+        validate_backup_file(safety_path)?;
+        restore_with_rollback(
+            connection,
+            source,
+            safety_path,
+            validate_library_connection,
+        )
+    })
+}
+
 #[tauri::command]
 async fn backup_library(
     app: tauri::AppHandle,
@@ -362,10 +413,22 @@ async fn backup_library(
 
 #[tauri::command]
 async fn export_library(
-    path: String,
+    app: tauri::AppHandle,
     database: State<'_, Database>,
-) -> Result<BackupResult, String> {
-    let destination = PathBuf::from(path);
+) -> Result<Option<BackupResult>, String> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Export Launchpad backup")
+        .set_file_name("launchpad-backup.sqlite3")
+        .add_filter("Launchpad backup", &["sqlite3"])
+        .blocking_save_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let destination = selected
+        .into_path()
+        .map_err(|_| "Launchpad could not use that backup destination.".to_string())?;
     if destination.is_dir() {
         return Err("Choose a backup file, not a folder.".to_string());
     }
@@ -376,53 +439,36 @@ async fn export_library(
         .to_string();
     let database = database.inner().clone();
     run_blocking(move || write_backup(&database, &destination)).await?;
-    Ok(BackupResult { file_name })
+    Ok(Some(BackupResult { file_name }))
 }
 
 #[tauri::command]
 async fn restore_library(
-    path: String,
     app: tauri::AppHandle,
     database: State<'_, Database>,
-) -> Result<LibraryState, String> {
-    let source = PathBuf::from(path);
+) -> Result<Option<LibraryState>, String> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Restore Launchpad backup")
+        .add_filter("Launchpad backup", &["sqlite3"])
+        .blocking_pick_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let source = selected
+        .into_path()
+        .map_err(|_| "Launchpad could not use that backup file.".to_string())?;
     let backup_dir = backup_directory(&app)?;
     let safety_name = timestamped_backup_name("launchpad-before-restore")?;
     let safety_path = backup_dir.join(safety_name);
     let database = database.inner().clone();
-
-    run_blocking({
+    let restored = run_blocking({
         let database = database.clone();
-        let source = source.clone();
-        let safety_path = safety_path.clone();
-        move || {
-            validate_backup_file(&source)?;
-            fs::create_dir_all(
-                safety_path
-                    .parent()
-                    .ok_or_else(|| "Launchpad could not create a safety backup.".to_string())?,
-            )
-            .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
-
-            database.with_connection(|connection| {
-                backup_database(connection, &safety_path)?;
-                if let Err(restore_error) = restore_database(connection, &source) {
-                    if let Err(rollback_error) = restore_database(connection, &safety_path) {
-                        eprintln!("Launchpad restore rollback failed: {rollback_error}");
-                        return Err(
-                            "Restore failed and Launchpad could not automatically roll back. Keep the safety backup and restart Launchpad."
-                                .to_string(),
-                        );
-                    }
-                    return Err(restore_error);
-                }
-                load_library_from_database(connection)
-            })
-        }
+        move || restore_library_from_path(&database, &source, &safety_path)
     })
     .await?;
-
-    run_blocking(move || refreshed_library(&database)).await
+    Ok(Some(restored))
 }
 
 fn initialize_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
@@ -469,6 +515,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspection::ProjectSnapshot;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);
@@ -490,6 +537,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn insert_project(database: &Database, name: &str, path: &str, make_active: bool) {
+        database
+            .with_connection(|connection| {
+                let snapshot = ProjectSnapshot {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    branch: "main".to_string(),
+                    git_status: "clean".to_string(),
+                    metadata_status: "fresh".to_string(),
+                    scripts: vec!["build".to_string()],
+                };
+                upsert_project(connection, &snapshot, None, make_active)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn create_library_file(path: &Path, name: &str) {
+        let database = Database::open(path).unwrap();
+        insert_project(&database, name, &format!("C:\\Repos\\{name}"), true);
     }
 
     #[test]
@@ -542,6 +611,53 @@ mod tests {
         assert_eq!(state.projects.len(), 1);
         assert_eq!(state.active_project_id, Some(state.projects[0].id));
         assert_eq!(state.projects[0].quest, "Keep this quest");
+    }
+
+    #[test]
+    fn verified_restore_replaces_the_live_library() {
+        let storage = TestDirectory::new("restore-success");
+        let source = storage.0.join("source.sqlite3");
+        let live = storage.0.join("live.sqlite3");
+        let safety = storage.0.join("safety.sqlite3");
+        create_library_file(&source, "Restored Project");
+        let database = Database::open(&live).unwrap();
+        insert_project(&database, "Original Project", "C:\\Repos\\Original", true);
+
+        let restored = restore_library_from_path(&database, &source, &safety).unwrap();
+        assert_eq!(restored.projects.len(), 1);
+        assert_eq!(restored.projects[0].name, "Restored Project");
+        let persisted = database
+            .with_connection(|connection| load_library_from_database(connection))
+            .unwrap();
+        assert_eq!(persisted.projects[0].name, "Restored Project");
+    }
+
+    #[test]
+    fn post_restore_verification_failure_rolls_back_the_live_library() {
+        let storage = TestDirectory::new("restore-rollback");
+        let source = storage.0.join("source.sqlite3");
+        let live = storage.0.join("live.sqlite3");
+        let safety = storage.0.join("safety.sqlite3");
+        create_library_file(&source, "Restored Project");
+        let database = Database::open(&live).unwrap();
+        insert_project(&database, "Original Project", "C:\\Repos\\Original", true);
+
+        let error = database
+            .with_connection(|connection| {
+                backup_database(connection, &safety)?;
+                validate_backup_file(&safety)?;
+                restore_with_rollback(connection, &source, &safety, |_| {
+                    Err("forced post-restore verification failure".to_string())
+                })
+            })
+            .unwrap_err();
+        assert!(error.contains("forced post-restore verification failure"));
+
+        let rolled_back = database
+            .with_connection(|connection| load_library_from_database(connection))
+            .unwrap();
+        assert_eq!(rolled_back.projects.len(), 1);
+        assert_eq!(rolled_back.projects[0].name, "Original Project");
     }
 
     #[cfg(target_os = "windows")]

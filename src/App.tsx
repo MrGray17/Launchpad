@@ -4,8 +4,6 @@ import {
   addProject as addProjectToLibrary,
   backupLibrary,
   bootstrapLibrary,
-  chooseBackupDestination,
-  chooseBackupFile,
   chooseProjectFolder,
   exportLibrary,
   isDesktopRuntime,
@@ -503,9 +501,8 @@ export default function App() {
     setAppMenuOpen(false);
     await runExclusive("export", async () => {
       try {
-        const path = await chooseBackupDestination();
-        if (!path) return;
-        const backup = await exportLibrary(path);
+        const backup = await exportLibrary();
+        if (!backup) return;
         setToast(`Backup exported: ${backup.fileName}`);
       } catch (error) {
         setToast(errorMessage(error, "Could not export the backup."));
@@ -515,12 +512,11 @@ export default function App() {
 
   async function restoreBackup() {
     setAppMenuOpen(false);
+    if (!window.confirm("Choose a Launchpad backup to restore? Launchpad will validate it and create a safety backup before changing your library.")) return;
     await runExclusive("restore", async () => {
       try {
-        const path = await chooseBackupFile();
-        if (!path) return;
-        if (!window.confirm("Restore this Launchpad backup? A safety backup of the current library will be created first.")) return;
-        const restored = await restoreLibrary(path);
+        const restored = await restoreLibrary();
+        if (!restored) return;
         setLibrary(restored);
         setFocusEditor(null);
         setProjectMenuOpen(false);

@@ -17,17 +17,19 @@ Launchpad turns local repositories into a visual project collection. It keeps on
 - Explicit Tauri command allowlist and restrictive CSP
 - Absolute project paths remain native and are not serialized to React
 - Internal online backups plus user-selected export and validated restore
-- Restore creates a safety backup first and attempts automatic rollback on failure
+- Restore validates SQLite integrity, schema version, foreign keys, and Launchpad's real library read path before mutation
+- Restore creates and verifies a safety backup first, then rolls back if restore **or post-restore verification** fails
+- Export/restore file dialogs are owned by the native Tauri commands; React cannot provide arbitrary filesystem destinations
 - Warm light and neutral dark appearances
 - Project-specific visual motifs instead of generic colored placeholder cards
-- React workflow tests, Rust domain tests, and a Windows release smoke gate
+- React workflow tests, Rust domain/recovery tests, and a Windows release smoke gate
 
 Arbitrary project command execution is intentionally absent until Launchpad has an explicit per-project trust model.
 
 ## Supported toolchain
 
 - Windows 10 or later
-- Node.js 22 (`>=22.22.2 <23`; CI uses 22.22.2)
+- Node.js 22 (`>=22.12 <23`; CI uses 22.22.2)
 - npm 11.6.0
 - Rust 1.97.1 with `rustfmt` and `clippy`
 - Tauri 2 prerequisites, including Microsoft C++ Build Tools and WebView2
@@ -52,8 +54,8 @@ Launchpad prefers `Code.exe` directly on Windows. If VS Code lives somewhere unu
 The app menu contains three maintenance actions:
 
 - **Back up now** — creates an online SQLite backup under Launchpad app-data
-- **Export backup…** — writes a backup to a user-selected location
-- **Restore backup…** — validates a current-version Launchpad backup, creates a pre-restore safety copy, then restores it
+- **Export backup…** — the native layer opens the save dialog and writes a backup to the selected location
+- **Restore backup…** — the native layer opens the file dialog, validates a current-version Launchpad library using the same read path as the app, creates and verifies a pre-restore safety copy, restores, verifies again, and rolls back on any restore/verification failure
 
 Moved or deleted project folders do not destroy project context. Use **Relink folder…** to point an existing project record at its new location, or remove the Launchpad record without deleting source files.
 
@@ -71,6 +73,13 @@ cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets --locked -- -D w
 npm run tauri build
 powershell -ExecutionPolicy Bypass -File scripts/smoke-release.ps1
 ```
+
+Recovery regression coverage includes:
+
+- rejecting a readable/current-version SQLite file with an incompatible Launchpad schema
+- accepting and restoring a database produced by Launchpad itself
+- rolling the live database back when post-restore verification fails
+- keeping export/restore filesystem paths entirely inside native Tauri commands
 
 Before a release, also run the real data-flow check with a disposable repository:
 
@@ -90,10 +99,10 @@ React UI
         `-- Tauri commands
               |-- project inspection / launchers
               |-- SQLite repository
-              `-- backup / restore recovery
+              `-- native-dialog backup / restore recovery
 ```
 
-Filesystem and Git inspection run outside the database mutex. React receives project IDs and display metadata rather than absolute filesystem paths.
+Filesystem and Git inspection run outside the database mutex. React receives project IDs and display metadata rather than absolute filesystem paths, and recovery destinations never cross the webview boundary.
 
 ## Product scope
 

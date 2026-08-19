@@ -12,8 +12,6 @@ const desktop = vi.hoisted(() => ({
   addProject: vi.fn(),
   backupLibrary: vi.fn(),
   bootstrapLibrary: vi.fn(),
-  chooseBackupDestination: vi.fn(),
-  chooseBackupFile: vi.fn(),
   chooseProjectFolder: vi.fn(),
   exportLibrary: vi.fn(),
   isDesktopRuntime: vi.fn(() => true),
@@ -74,8 +72,6 @@ describe("Launchpad hardened project lifecycle", () => {
     desktop.isDesktopRuntime.mockReturnValue(true);
     desktop.bootstrapLibrary.mockResolvedValue(bootstrap);
     desktop.chooseProjectFolder.mockResolvedValue(null);
-    desktop.chooseBackupFile.mockResolvedValue(null);
-    desktop.chooseBackupDestination.mockResolvedValue(null);
     desktop.activateProject.mockResolvedValue(project);
     desktop.addProject.mockResolvedValue(project);
     desktop.refreshProject.mockResolvedValue(project);
@@ -246,9 +242,7 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(desktop.bootstrapLibrary).not.toHaveBeenCalled();
   });
 
-  it("creates, exports, and restores backups from the app menu", async () => {
-    desktop.chooseBackupDestination.mockResolvedValue("D:\\export.sqlite3");
-    desktop.chooseBackupFile.mockResolvedValue("D:\\restore.sqlite3");
+  it("creates, exports, and restores backups through native recovery commands", async () => {
     render(<App />);
     await screen.findByRole("button", { name: /Continue Rate Limiter/ });
 
@@ -258,12 +252,28 @@ describe("Launchpad hardened project lifecycle", () => {
 
     openAppMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Export backup…" }));
-    await waitFor(() => expect(desktop.exportLibrary).toHaveBeenCalledWith("D:\\export.sqlite3"));
+    await waitFor(() => expect(desktop.exportLibrary).toHaveBeenCalledWith());
 
     openAppMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Restore backup…" }));
-    await waitFor(() => expect(desktop.restoreLibrary).toHaveBeenCalledWith("D:\\restore.sqlite3"));
+    await waitFor(() => expect(desktop.restoreLibrary).toHaveBeenCalledWith());
     expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("safety backup"));
+  });
+
+  it("does not mutate UI state when native export or restore dialogs are cancelled", async () => {
+    desktop.exportLibrary.mockResolvedValueOnce(null);
+    desktop.restoreLibrary.mockResolvedValueOnce(null);
+    render(<App />);
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export backup…" }));
+    await waitFor(() => expect(desktop.exportLibrary).toHaveBeenCalledOnce());
+
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restore backup…" }));
+    await waitFor(() => expect(desktop.restoreLibrary).toHaveBeenCalledOnce());
+    expect(screen.getByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
   });
 
   it("gives known projects distinct visual motifs and Unicode-safe initials", async () => {

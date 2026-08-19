@@ -6,8 +6,6 @@ import {
   addProject,
   backupLibrary,
   bootstrapLibrary,
-  chooseBackupDestination,
-  chooseBackupFile,
   chooseProjectFolder,
   exportLibrary,
   isDesktopRuntime,
@@ -24,11 +22,10 @@ const native = vi.hoisted(() => ({
   invoke: vi.fn(),
   isTauri: vi.fn(() => true),
   open: vi.fn(),
-  save: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke, isTauri: native.isTauri }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: native.open, save: native.save }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: native.open }));
 
 describe("desktop platform boundary", () => {
   beforeEach(() => {
@@ -36,7 +33,6 @@ describe("desktop platform boundary", () => {
     native.isTauri.mockReturnValue(true);
     native.invoke.mockResolvedValue(undefined);
     native.open.mockResolvedValue(null);
-    native.save.mockResolvedValue(null);
   });
 
   afterEach(() => vi.restoreAllMocks());
@@ -53,8 +49,8 @@ describe("desktop platform boundary", () => {
     await openInCode(4);
     await openTerminal(4);
     await backupLibrary();
-    await exportLibrary("D:\\launchpad-backup.sqlite3");
-    await restoreLibrary("D:\\launchpad-backup.sqlite3");
+    await exportLibrary();
+    await restoreLibrary();
 
     expect(native.invoke.mock.calls).toEqual([
       ["bootstrap", { projects: legacy, activeLegacyId: "old" }],
@@ -67,30 +63,19 @@ describe("desktop platform boundary", () => {
       ["open_in_vscode", { id: 4 }],
       ["open_terminal", { id: 4 }],
       ["backup_library", undefined],
-      ["export_library", { path: "D:\\launchpad-backup.sqlite3" }],
-      ["restore_library", { path: "D:\\launchpad-backup.sqlite3" }],
+      ["export_library", undefined],
+      ["restore_library", undefined],
     ]);
   });
 
-  it("uses native dialogs for folders, backup import, and backup export", async () => {
-    native.open.mockResolvedValueOnce("C:\\repo").mockResolvedValueOnce("D:\\backup.sqlite3");
-    native.save.mockResolvedValue("D:\\export.sqlite3");
+  it("uses the frontend dialog only for selecting project folders", async () => {
+    native.open.mockResolvedValue("C:\\repo");
 
     expect(isDesktopRuntime()).toBe(true);
     await expect(chooseProjectFolder()).resolves.toBe("C:\\repo");
-    await expect(chooseBackupFile()).resolves.toBe("D:\\backup.sqlite3");
-    await expect(chooseBackupDestination()).resolves.toBe("D:\\export.sqlite3");
 
-    expect(native.open).toHaveBeenNthCalledWith(1, { directory: true, multiple: false });
-    expect(native.open).toHaveBeenNthCalledWith(2, {
-      directory: false,
-      multiple: false,
-      filters: [{ name: "Launchpad backup", extensions: ["sqlite3"] }],
-    });
-    expect(native.save).toHaveBeenCalledWith({
-      defaultPath: "launchpad-backup.sqlite3",
-      filters: [{ name: "Launchpad backup", extensions: ["sqlite3"] }],
-    });
+    expect(native.open).toHaveBeenCalledOnce();
+    expect(native.open).toHaveBeenCalledWith({ directory: true, multiple: false });
   });
 
   it("keeps browser preview read-only and never attempts native IPC", async () => {
@@ -100,13 +85,16 @@ describe("desktop platform boundary", () => {
       projects: [], activeProjectId: null, pendingLegacyIds: [], legacyMigrationComplete: true,
     });
     await expect(chooseProjectFolder()).resolves.toBeNull();
-    await expect(chooseBackupFile()).resolves.toBeNull();
-    await expect(chooseBackupDestination()).resolves.toBeNull();
     await expect(addProject("C:\\repo")).rejects.toThrow(
+      "This action is available in the Launchpad desktop app.",
+    );
+    await expect(exportLibrary()).rejects.toThrow(
+      "This action is available in the Launchpad desktop app.",
+    );
+    await expect(restoreLibrary()).rejects.toThrow(
       "This action is available in the Launchpad desktop app.",
     );
     expect(native.invoke).not.toHaveBeenCalled();
     expect(native.open).not.toHaveBeenCalled();
-    expect(native.save).not.toHaveBeenCalled();
   });
 });
