@@ -90,9 +90,9 @@ fn validate_table_shapes(connection: &Connection) -> Result<(), String> {
         .collect::<Vec<_>>();
     if preference_names != EXPECTED_PREFERENCE_COLUMNS
         || preferences.first().map(|(_, _, primary_key)| *primary_key) != Some(1)
-        || !preferences.iter().any(|(name, not_null, _)| {
-            name == "legacy_migration_complete" && *not_null
-        })
+        || !preferences
+            .iter()
+            .any(|(name, not_null, _)| name == "legacy_migration_complete" && *not_null)
     {
         return Err("That file is not a valid Launchpad library backup.".to_string());
     }
@@ -123,9 +123,7 @@ fn has_unique_project_path(connection: &Connection) -> Result<bool, String> {
             })?;
         let columns = index_statement
             .query_map([], |row| row.get::<_, Option<String>>(2))
-            .map_err(|error| {
-                recovery_error("That backup structure could not be verified.", error)
-            })?
+            .map_err(|error| recovery_error("That backup structure could not be verified.", error))?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 recovery_error("That backup structure could not be verified.", error)
@@ -282,8 +280,9 @@ pub(crate) fn validate_library_connection(connection: &Connection) -> Result<Lib
 
     validate_project_rows(connection)?;
     validate_preferences(connection)?;
-    load_library(connection)
-        .map_err(|error| recovery_error("That file is not a valid Launchpad library backup.", error))
+    load_library(connection).map_err(|error| {
+        recovery_error("That file is not a valid Launchpad library backup.", error)
+    })
 }
 
 pub(crate) fn validate_backup_file(path: &Path) -> Result<LibraryState, String> {

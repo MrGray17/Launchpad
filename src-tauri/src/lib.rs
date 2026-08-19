@@ -635,12 +635,7 @@ mod tests {
         let existing = TestDirectory::new("availability-existing");
         let storage = TestDirectory::new("availability-database");
         let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
-        insert_project(
-            &database,
-            "Existing",
-            &existing.0.to_string_lossy(),
-            true,
-        );
+        insert_project(&database, "Existing", &existing.0.to_string_lossy(), true);
         insert_project(
             &database,
             "Missing",
