@@ -41,7 +41,9 @@ pub(crate) fn validate_backup_file(path: &Path) -> Result<(), String> {
                 [table],
                 |row| row.get::<_, i64>(0),
             )
-            .map_err(|error| recovery_error("That backup structure could not be verified.", error))?;
+            .map_err(|error| {
+                recovery_error("That backup structure could not be verified.", error)
+            })?;
         if count != 1 {
             return Err("That file is not a valid Launchpad library backup.".to_string());
         }
@@ -61,14 +63,20 @@ pub(crate) fn restore_database(connection: &mut Connection, path: &Path) -> Resu
              PRAGMA synchronous = NORMAL;
              PRAGMA busy_timeout = 5000;",
         )
-        .map_err(|error| recovery_error("The restored library could not be reopened safely.", error))?;
+        .map_err(|error| {
+            recovery_error("The restored library could not be reopened safely.", error)
+        })?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     struct TestFiles(PathBuf);
 
