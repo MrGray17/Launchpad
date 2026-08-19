@@ -36,6 +36,9 @@ type Operation =
   | "export"
   | "restore";
 type FocusEditor = { projectId: number; quest: string; checkpoint: string };
+type BootstrapAppState = Awaited<ReturnType<typeof bootstrapLibrary>> & {
+  prototypeWarning: string | null;
+};
 
 const LEGACY_PROJECTS_KEY = "launchpad.projects.v1";
 const LEGACY_ACTIVE_KEY = "launchpad.active-project.v1";
@@ -111,9 +114,26 @@ function reconcileLegacyStorage(
   if (!activeId || !pending.has(activeId)) localStorage.removeItem(LEGACY_ACTIVE_KEY);
 }
 
-async function bootstrapApp() {
-  if (!isDesktopRuntime()) return bootstrapLibrary([], null);
-  const legacy = readLegacyState();
+async function bootstrapApp(): Promise<BootstrapAppState> {
+  if (!isDesktopRuntime()) {
+    const state = await bootstrapLibrary([], null);
+    return { ...state, prototypeWarning: null };
+  }
+
+  let legacy: ReturnType<typeof readLegacyState>;
+  try {
+    legacy = readLegacyState();
+  } catch (error) {
+    const state = await bootstrapLibrary([], null);
+    return {
+      ...state,
+      prototypeWarning: errorMessage(
+        error,
+        "Launchpad found prototype data it could not migrate and left it untouched.",
+      ),
+    };
+  }
+
   const state = await bootstrapLibrary(legacy.projects, legacy.activeId);
   reconcileLegacyStorage(
     legacy.raw,
@@ -121,7 +141,7 @@ async function bootstrapApp() {
     legacy.activeId,
     state.legacyMigrationComplete,
   );
-  return state;
+  return { ...state, prototypeWarning: null };
 }
 
 function hashName(name: string) {
@@ -257,7 +277,9 @@ export default function App() {
       .then((state) => {
         if (!cancelled) {
           setLibrary({ projects: state.projects, activeProjectId: state.activeProjectId });
-          if (state.pendingLegacyIds.length) {
+          if (state.prototypeWarning) {
+            setToast(state.prototypeWarning);
+          } else if (state.pendingLegacyIds.length) {
             setToast(`${state.pendingLegacyIds.length} prototype project${state.pendingLegacyIds.length === 1 ? " is" : "s are"} waiting for its folder to return.`);
           }
         }
