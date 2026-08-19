@@ -6,6 +6,7 @@ import App from "./App";
 import type { LibraryState, Project } from "./platform/desktop";
 
 const desktop = vi.hoisted(() => ({
+  activateProject: vi.fn(),
   addProject: vi.fn(),
   chooseProjectFolder: vi.fn(),
   importLegacyProjects: vi.fn(),
@@ -13,9 +14,7 @@ const desktop = vi.hoisted(() => ({
   loadLibrary: vi.fn(),
   openInCode: vi.fn(),
   openTerminal: vi.fn(),
-  refreshProject: vi.fn(),
   saveProjectFocus: vi.fn(),
-  selectProject: vi.fn(),
 }));
 
 vi.mock("./platform/desktop", () => desktop);
@@ -54,8 +53,7 @@ describe("Launchpad project flow", () => {
     desktop.importLegacyProjects.mockResolvedValue(library);
     desktop.chooseProjectFolder.mockResolvedValue(null);
     desktop.addProject.mockResolvedValue(project);
-    desktop.refreshProject.mockResolvedValue(project);
-    desktop.selectProject.mockResolvedValue(undefined);
+    desktop.activateProject.mockResolvedValue(project);
     desktop.saveProjectFocus.mockResolvedValue(project);
     desktop.openTerminal.mockResolvedValue(undefined);
     desktop.openInCode.mockResolvedValue({ ...project, lastOpenedAt: "2026-08-19T10:00:00.000Z" });
@@ -152,23 +150,22 @@ describe("Launchpad project flow", () => {
       projects: [project, secondProject],
       activeProjectId: project.id,
     });
-    desktop.refreshProject.mockResolvedValue({ ...secondProject, branch: "feat/parser-v2" });
+    desktop.activateProject.mockResolvedValue({ ...secondProject, branch: "feat/parser-v2" });
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: /Compiler Lab/ }));
 
-    await waitFor(() => expect(desktop.selectProject).toHaveBeenCalledWith(8));
-    expect(desktop.refreshProject).toHaveBeenCalledWith(8);
+    await waitFor(() => expect(desktop.activateProject).toHaveBeenCalledWith(8));
     expect(await screen.findByRole("button", { name: /Continue Compiler Lab/ })).toBeTruthy();
     expect(document.querySelector(".git-line")?.textContent).toContain("feat/parser-v2");
   });
 
-  it("rolls back an optimistic selection when native refresh fails", async () => {
+  it("preserves the current selection when atomic native activation fails", async () => {
     desktop.loadLibrary.mockResolvedValue({
       projects: [project, secondProject],
       activeProjectId: project.id,
     });
-    desktop.refreshProject.mockRejectedValue("That project folder does not exist.");
+    desktop.activateProject.mockRejectedValue("That project folder does not exist.");
     render(<App />);
 
     fireEvent.click(await screen.findByRole("button", { name: /Compiler Lab/ }));

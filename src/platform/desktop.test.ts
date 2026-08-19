@@ -2,6 +2,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  activateProject,
   addProject,
   chooseProjectFolder,
   importLegacyProjects,
@@ -9,9 +10,7 @@ import {
   loadLibrary,
   openInCode,
   openTerminal,
-  refreshProject,
   saveProjectFocus,
-  selectProject,
 } from "./desktop";
 
 const native = vi.hoisted(() => ({
@@ -47,8 +46,7 @@ describe("desktop platform boundary", () => {
     await loadLibrary();
     await importLegacyProjects([{ path: "C:\\repo", quest: "Ship" }]);
     await addProject("C:\\repo");
-    await refreshProject(4);
-    await selectProject(null);
+    await activateProject(4);
     await saveProjectFocus(4, "Ship", "Run the tests");
     await openInCode(4);
     await openTerminal(4);
@@ -57,8 +55,7 @@ describe("desktop platform boundary", () => {
       ["load_library", undefined],
       ["import_legacy_projects", { projects: [{ path: "C:\\repo", quest: "Ship" }] }],
       ["add_project", { path: "C:\\repo" }],
-      ["refresh_project", { id: 4 }],
-      ["select_project", { id: null }],
+      ["activate_project", { id: 4 }],
       ["save_project_focus", { id: 4, quest: "Ship", checkpoint: "Run the tests" }],
       ["open_in_vscode", { id: 4 }],
       ["open_terminal", { id: 4 }],

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  activateProject as activateProjectInLibrary,
   addProject as addProjectToLibrary,
   chooseProjectFolder,
   importLegacyProjects,
@@ -7,9 +8,7 @@ import {
   loadLibrary,
   openInCode,
   openTerminal,
-  refreshProject,
   saveProjectFocus,
-  selectProject,
   type LegacyProject,
   type LibraryState,
   type Project,
@@ -184,17 +183,14 @@ export default function App() {
 
   async function activateProject(project: Project) {
     if (!library || project.id === active?.id) return;
-    const previousId = library.activeProjectId;
-    setLibrary({ ...library, activeProjectId: project.id });
     try {
-      await selectProject(project.id);
-      const refreshed = await refreshProject(project.id);
+      const refreshed = await activateProjectInLibrary(project.id);
       setLibrary((current) => current ? {
         ...current,
+        activeProjectId: refreshed.id,
         projects: replaceProject(current.projects, refreshed),
       } : current);
     } catch (error) {
-      setLibrary((current) => current ? { ...current, activeProjectId: previousId } : current);
       setToast(errorMessage(error, "Could not select that project."));
     }
   }

@@ -1,8 +1,8 @@
 mod database;
 
 use database::{
-    load_library as load_library_from_database, mark_opened, project_path, set_active_project,
-    update_focus, upsert_project, Database, LegacyProject, LibraryState, Project,
+    load_library as load_library_from_database, mark_opened, project_path, update_focus,
+    upsert_project, Database, LegacyProject, LibraryState, Project,
 };
 use serde::Serialize;
 use std::{
@@ -180,22 +180,20 @@ async fn import_legacy_projects(
     .await
 }
 
-#[tauri::command]
-async fn refresh_project(id: i64, database: State<'_, Database>) -> Result<Project, String> {
-    let database = database.inner().clone();
-    run_database(database, move |connection| {
-        let path = project_path(connection, id)?;
-        let snapshot = inspect_project_path(path)?;
-        upsert_project(connection, &snapshot, None, false)
-    })
-    .await
+fn activate_project_record(
+    connection: &mut rusqlite::Connection,
+    id: i64,
+) -> Result<Project, String> {
+    let path = project_path(connection, id)?;
+    let snapshot = inspect_project_path(path)?;
+    upsert_project(connection, &snapshot, None, true)
 }
 
 #[tauri::command]
-async fn select_project(id: Option<i64>, database: State<'_, Database>) -> Result<(), String> {
+async fn activate_project(id: i64, database: State<'_, Database>) -> Result<Project, String> {
     let database = database.inner().clone();
     run_database(database, move |connection| {
-        set_active_project(connection, id)
+        activate_project_record(connection, id)
     })
     .await
 }
@@ -288,8 +286,7 @@ pub fn run() {
             load_library,
             add_project,
             import_legacy_projects,
-            refresh_project,
-            select_project,
+            activate_project,
             save_project_focus,
             open_in_vscode,
             open_terminal
@@ -367,6 +364,35 @@ mod tests {
         let error = inspect_project_path(missing.to_string_lossy().to_string())
             .expect_err("missing folders should be rejected");
         assert_eq!(error, "That project folder does not exist.");
+    }
+
+    #[test]
+    fn failed_activation_does_not_change_the_persisted_active_project() {
+        let first = TestProject::new("active-first");
+        let missing = TestProject::new("active-missing");
+        let storage = TestProject::new("active-database");
+        let first_snapshot = inspect_project_path(first.0.to_string_lossy().to_string()).unwrap();
+        let missing_snapshot =
+            inspect_project_path(missing.0.to_string_lossy().to_string()).unwrap();
+        let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
+
+        let (first_id, missing_id) = database
+            .with_connection(|connection| {
+                let first_project = upsert_project(connection, &first_snapshot, None, true)?;
+                let missing_project = upsert_project(connection, &missing_snapshot, None, false)?;
+                Ok((first_project.id, missing_project.id))
+            })
+            .unwrap();
+        fs::remove_dir_all(&missing.0).expect("project folder should be removed for the test");
+
+        database
+            .with_connection(|connection| {
+                assert!(activate_project_record(connection, missing_id).is_err());
+                let library = load_library_from_database(connection)?;
+                assert_eq!(library.active_project_id, Some(first_id));
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

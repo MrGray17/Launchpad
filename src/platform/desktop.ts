@@ -59,12 +59,8 @@ export function addProject(path: string): Promise<Project> {
   return invoke<Project>("add_project", { path });
 }
 
-export function refreshProject(id: number): Promise<Project> {
-  return invoke<Project>("refresh_project", { id });
-}
-
-export function selectProject(id: number | null): Promise<void> {
-  return invoke<void>("select_project", { id });
+export function activateProject(id: number): Promise<Project> {
+  return invoke<Project>("activate_project", { id });
 }
 
 export function saveProjectFocus(

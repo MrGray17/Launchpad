@@ -262,19 +262,6 @@ pub(crate) fn upsert_project(
     project_by_id(connection, id)
 }
 
-pub(crate) fn set_active_project(connection: &Connection, id: Option<i64>) -> Result<(), String> {
-    if let Some(project_id) = id {
-        project_by_id(connection, project_id)?;
-    }
-    connection
-        .execute(
-            "UPDATE preferences SET active_project_id = ?1 WHERE singleton = 1",
-            [id],
-        )
-        .map_err(database_error)?;
-    Ok(())
-}
-
 pub(crate) fn update_focus(
     connection: &Connection,
     id: i64,
@@ -446,24 +433,6 @@ mod tests {
             "Close and reopen the SQLite connection."
         );
         assert!(library.projects[0].last_opened_at.is_some());
-    }
-
-    #[test]
-    fn active_project_rejects_unknown_ids_and_can_be_cleared() {
-        let database = Database::in_memory();
-        database
-            .with_connection(|connection| {
-                let project = upsert_project(connection, &snapshot("C:\\repo"), None, true)?;
-                assert!(set_active_project(connection, Some(project.id + 100)).is_err());
-                assert_eq!(
-                    load_library(connection)?.active_project_id,
-                    Some(project.id)
-                );
-                set_active_project(connection, None)?;
-                assert_eq!(load_library(connection)?.active_project_id, None);
-                Ok(())
-            })
-            .unwrap();
     }
 
     #[test]
