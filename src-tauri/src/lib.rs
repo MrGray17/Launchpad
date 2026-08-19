@@ -202,15 +202,25 @@ fn spawn_first_available(mut candidates: Vec<Command>, failure: &str) -> Result<
     Err(failure.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn is_windows_executable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
 fn editor_candidates(project_path: &Path) -> Vec<Command> {
     let mut candidates = Vec::new();
 
     #[cfg(target_os = "windows")]
     {
         if let Some(explicit) = std::env::var_os("LAUNCHPAD_VSCODE") {
-            let mut command = Command::new(explicit);
-            command.arg(project_path);
-            candidates.push(command);
+            let explicit = PathBuf::from(explicit);
+            if is_windows_executable(&explicit) {
+                let mut command = Command::new(explicit);
+                command.arg(project_path);
+                candidates.push(command);
+            }
         }
 
         let mut from_path = Command::new("Code.exe");
@@ -351,7 +361,10 @@ async fn backup_library(
 }
 
 #[tauri::command]
-async fn export_library(path: String, database: State<'_, Database>) -> Result<BackupResult, String> {
+async fn export_library(
+    path: String,
+    database: State<'_, Database>,
+) -> Result<BackupResult, String> {
     let destination = PathBuf::from(path);
     if destination.is_dir() {
         return Err("Choose a backup file, not a folder.".to_string());
