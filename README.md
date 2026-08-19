@@ -27,7 +27,7 @@ Arbitrary project command execution is intentionally absent until Launchpad has 
 ## Supported toolchain
 
 - Windows 10 or later
-- Node.js 22 (`>=22.12 <23`; CI uses 22.22.0)
+- Node.js 22 (`>=22.22.2 <23`; CI uses 22.22.2)
 - npm 11.6.0
 - Rust 1.97.1 with `rustfmt` and `clippy`
 - Tauri 2 prerequisites, including Microsoft C++ Build Tools and WebView2
