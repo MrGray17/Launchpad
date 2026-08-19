@@ -276,6 +276,33 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(screen.getByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
   });
 
+  it("recovers from a bootstrap error through the restore menu", async () => {
+    desktop.bootstrapLibrary.mockRejectedValueOnce("Launchpad's library appears damaged. Restore a recent Launchpad backup.");
+    render(<App />);
+    expect((await screen.findByRole("alert")).textContent).toContain("appears damaged");
+
+    openAppMenu();
+    expect(screen.getByRole("menuitem", { name: "Back up now" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("menuitem", { name: "Export backup…" })).toHaveProperty("disabled", true);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restore backup…" }));
+
+    await waitFor(() => expect(desktop.restoreLibrary).toHaveBeenCalledOnce());
+    expect(await screen.findByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
+    expect(screen.queryByText("Launchpad could not open.")).toBeNull();
+  });
+
+  it("shows restore failures while the library is in recovery mode", async () => {
+    desktop.bootstrapLibrary.mockRejectedValueOnce("Launchpad's library appears damaged. Restore a recent Launchpad backup.");
+    desktop.restoreLibrary.mockRejectedValueOnce("That backup appears damaged and was not restored.");
+    render(<App />);
+    await screen.findByRole("alert");
+
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restore backup…" }));
+    expect((await screen.findByRole("status")).textContent).toContain("backup appears damaged");
+    expect(screen.getByRole("alert").textContent).toContain("appears damaged");
+  });
+
   it("gives known projects distinct visual motifs and Unicode-safe initials", async () => {
     const names = ["Rate Limiter", "Nest", "Maw3id", "Sifr", "Launchpad", "🌸 Garden"];
     desktop.bootstrapLibrary.mockResolvedValue({
