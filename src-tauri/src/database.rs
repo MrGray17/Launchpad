@@ -178,7 +178,8 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
-        available: Path::new(&path).is_dir(),
+        // Filesystem availability is hydrated after the SQLite mutex is released.
+        available: false,
         path,
         branch: row.get(3)?,
         git_status: row.get(4)?,

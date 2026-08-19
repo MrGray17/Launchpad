@@ -56,6 +56,18 @@ where
     run_blocking(move || database.with_connection(operation)).await
 }
 
+fn hydrate_project_availability(mut project: Project) -> Project {
+    project.available = Path::new(&project.path).is_dir();
+    project
+}
+
+fn hydrate_library_availability(mut library: LibraryState) -> LibraryState {
+    for project in &mut library.projects {
+        project.available = Path::new(&project.path).is_dir();
+    }
+    library
+}
+
 fn refresh_project_record(
     database: &Database,
     id: i64,
@@ -64,17 +76,20 @@ fn refresh_project_record(
 ) -> Result<Project, String> {
     let path = database.with_connection(|connection| project_path(connection, id))?;
     let snapshot = inspect_project_path(path)?;
-    database.with_connection(|connection| {
+    let project = database.with_connection(|connection| {
         update_metadata(connection, id, &snapshot, make_active, mark_as_opened)
-    })
+    })?;
+    Ok(hydrate_project_availability(project))
 }
 
 fn refreshed_library(database: &Database) -> Result<LibraryState, String> {
     let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    let library = hydrate_library_availability(library);
     if let Some(active_id) = library.active_project_id {
         let _ = refresh_project_record(database, active_id, true, false);
     }
-    database.with_connection(|connection| load_library_from_database(connection))
+    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    Ok(hydrate_library_availability(library))
 }
 
 fn bootstrap_library(
@@ -134,10 +149,11 @@ async fn bootstrap(
 async fn add_project(path: String, database: State<'_, Database>) -> Result<Project, String> {
     let snapshot = run_blocking(move || inspect_project_path(path)).await?;
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let project = run_database(database, move |connection| {
         upsert_project(connection, &snapshot, None, true)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_project_availability(project))).await
 }
 
 #[tauri::command]
@@ -160,19 +176,21 @@ async fn relink_project(
 ) -> Result<Project, String> {
     let snapshot = run_blocking(move || inspect_project_path(path)).await?;
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let project = run_database(database, move |connection| {
         relink_in_database(connection, id, &snapshot)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_project_availability(project))).await
 }
 
 #[tauri::command]
 async fn remove_project(id: i64, database: State<'_, Database>) -> Result<LibraryState, String> {
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let library = run_database(database, move |connection| {
         remove_from_database(connection, id)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_library_availability(library))).await
 }
 
 #[tauri::command]
@@ -183,10 +201,11 @@ async fn save_project_focus(
     database: State<'_, Database>,
 ) -> Result<Project, String> {
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let project = run_database(database, move |connection| {
         update_focus(connection, id, &quest, &checkpoint)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_project_availability(project))).await
 }
 
 fn spawn_first_available(mut candidates: Vec<Command>, failure: &str) -> Result<(), String> {
@@ -310,7 +329,9 @@ fn open_project(database: &Database, id: i64, terminal: bool) -> Result<Project,
             "VS Code could not be opened. Install VS Code or set LAUNCHPAD_VSCODE to Code.exe.",
         )?;
     }
-    database.with_connection(|connection| update_metadata(connection, id, &snapshot, false, true))
+    let project = database
+        .with_connection(|connection| update_metadata(connection, id, &snapshot, false, true))?;
+    Ok(hydrate_project_availability(project))
 }
 
 #[tauri::command]
@@ -386,11 +407,12 @@ fn restore_library_from_path(
             .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
     }
 
-    database.with_connection(|connection| {
+    let restored = database.with_connection(|connection| {
         backup_database(connection, safety_path)?;
         validate_backup_file(safety_path)?;
         restore_with_rollback(connection, source, safety_path, validate_library_connection)
-    })
+    })?;
+    Ok(hydrate_library_availability(restored))
 }
 
 #[tauri::command]
@@ -606,6 +628,42 @@ mod tests {
         assert_eq!(state.projects.len(), 1);
         assert_eq!(state.active_project_id, Some(state.projects[0].id));
         assert_eq!(state.projects[0].quest, "Keep this quest");
+    }
+
+    #[test]
+    fn database_reads_do_not_probe_the_filesystem_while_locked() {
+        let existing = TestDirectory::new("availability-existing");
+        let storage = TestDirectory::new("availability-database");
+        let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
+        insert_project(
+            &database,
+            "Existing",
+            &existing.0.to_string_lossy(),
+            true,
+        );
+        insert_project(
+            &database,
+            "Missing",
+            &storage.0.join("missing").to_string_lossy(),
+            false,
+        );
+
+        let persisted = database
+            .with_connection(|connection| load_library_from_database(connection))
+            .unwrap();
+        assert!(persisted.projects.iter().all(|project| !project.available));
+
+        let hydrated = hydrate_library_availability(persisted);
+        assert!(hydrated
+            .projects
+            .iter()
+            .find(|project| project.name == "Existing")
+            .is_some_and(|project| project.available));
+        assert!(hydrated
+            .projects
+            .iter()
+            .find(|project| project.name == "Missing")
+            .is_some_and(|project| !project.available));
     }
 
     #[test]
