@@ -643,7 +643,10 @@ mod tests {
         let storage = TestDatabase::new("unavailable");
         let database = Database::unavailable(&storage.path, "broken library".to_string());
         assert!(!database.is_available());
-        assert_eq!(database.unavailable_error().as_deref(), Some("broken library"));
+        assert_eq!(
+            database.unavailable_error().as_deref(),
+            Some("broken library")
+        );
         assert!(database.with_connection(|_| Ok(())).is_err());
 
         let healthy = Database::open(&storage.path).unwrap();
