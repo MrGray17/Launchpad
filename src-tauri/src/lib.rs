@@ -389,12 +389,7 @@ fn restore_library_from_path(
     database.with_connection(|connection| {
         backup_database(connection, safety_path)?;
         validate_backup_file(safety_path)?;
-        restore_with_rollback(
-            connection,
-            source,
-            safety_path,
-            validate_library_connection,
-        )
+        restore_with_rollback(connection, source, safety_path, validate_library_connection)
     })
 }
 
