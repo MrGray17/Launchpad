@@ -518,6 +518,7 @@ export default function App() {
         const restored = await restoreLibrary();
         if (!restored) return;
         setLibrary(restored);
+        setLoadError(null);
         setFocusEditor(null);
         setProjectMenuOpen(false);
         setToast("Library restored safely.");
@@ -547,8 +548,8 @@ export default function App() {
             </button>
             <div className="menu-rule" />
             <span className="menu-label">Library</span>
-            <button type="button" role="menuitem" onClick={createBackup} disabled={isBusy}>Back up now</button>
-            <button type="button" role="menuitem" onClick={exportBackup} disabled={isBusy}>Export backup…</button>
+            <button type="button" role="menuitem" onClick={createBackup} disabled={isBusy || Boolean(loadError)}>Back up now</button>
+            <button type="button" role="menuitem" onClick={exportBackup} disabled={isBusy || Boolean(loadError)}>Export backup…</button>
             <button type="button" role="menuitem" onClick={restoreBackup} disabled={isBusy}>Restore backup…</button>
           </div>
         )}
@@ -561,7 +562,20 @@ export default function App() {
   }
 
   if (loadError) {
-    return <div className="app-shell">{header}<main className="state-page"><div className="state-card error-card" role="alert"><span className="state-glyph">!</span><h1>Launchpad could not open.</h1><p>{loadError}</p><button type="button" onClick={() => { setLibrary(null); setReloadKey((key) => key + 1); }}>Try again</button></div></main></div>;
+    return (
+      <div className="app-shell">
+        {header}
+        <main className="state-page">
+          <div className="state-card error-card" role="alert">
+            <span className="state-glyph">!</span>
+            <h1>Launchpad could not open.</h1>
+            <p>{loadError}</p>
+            <button type="button" onClick={() => { setLibrary(null); setReloadKey((key) => key + 1); }}>Try again</button>
+          </div>
+        </main>
+        {toast && <div className="toast" role="status">{toast}</div>}
+      </div>
+    );
   }
 
   if (!active) {
