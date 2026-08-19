@@ -377,6 +377,25 @@ fn write_backup(database: &Database, path: &Path) -> Result<(), String> {
     database.with_connection(|connection| backup_database(connection, path))
 }
 
+fn snapshot_backup_file(source: &Path, destination: &Path) -> Result<(), String> {
+    validate_backup_file(source)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create the restore staging folder.".to_string())?;
+    }
+    let source_connection = rusqlite::Connection::open_with_flags(
+        source,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(|error| {
+        eprintln!("Launchpad restore source open failed: {error}");
+        "That file is not a readable Launchpad backup.".to_string()
+    })?;
+    backup_database(&source_connection, destination)?;
+    drop(source_connection);
+    validate_backup_file(destination).map(|_| ())
+}
+
 fn same_file_path(first: &Path, second: &Path) -> bool {
     if first == second {
         return true;
@@ -516,7 +535,6 @@ where
     if same_file_path(source, &live_path) {
         return Err("Choose a backup file other than Launchpad's live library.".to_string());
     }
-    validate_backup_file(source)?;
 
     let live_parent = live_path
         .parent()
@@ -529,12 +547,8 @@ where
     }
 
     let stage_path = live_parent.join(timestamped_backup_name("launchpad-restore-stage")?);
-    fs::copy(source, &stage_path).map_err(|error| {
-        eprintln!("Launchpad restore staging failed: {error}");
-        "Launchpad could not stage that backup safely.".to_string()
-    })?;
-    if let Err(error) = validate_backup_file(&stage_path) {
-        let _ = fs::remove_file(&stage_path);
+    if let Err(error) = snapshot_backup_file(source, &stage_path) {
+        let _ = clear_raw_database(&stage_path);
         return Err(error);
     }
 
@@ -555,7 +569,7 @@ where
         Err(restore_error) => {
             let _ = database.mark_unavailable(original_error.clone());
             let rollback = restore_raw_database(safety_path, &live_path, presence);
-            let _ = fs::remove_file(&stage_path);
+            let _ = clear_raw_database(&stage_path);
             if let Err(rollback_error) = rollback {
                 eprintln!("Launchpad raw recovery rollback failed: {rollback_error}");
                 return Err(
@@ -583,14 +597,10 @@ fn restore_library_from_path(
     }
 
     if !database.is_available() {
-        let restored = restore_unavailable_database_with_verify(
-            database,
-            source,
-            safety_path,
-            |database| {
+        let restored =
+            restore_unavailable_database_with_verify(database, source, safety_path, |database| {
                 database.with_connection(|connection| validate_library_connection(connection))
-            },
-        )?;
+            })?;
         return Ok(hydrate_library_availability(restored));
     }
 
@@ -868,6 +878,37 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_backup_file_includes_committed_wal_state() {
+        let storage = TestDirectory::new("wal-snapshot");
+        let source = storage.0.join("source.sqlite3");
+        let staged = storage.0.join("staged.sqlite3");
+        let database = Database::open(&source).unwrap();
+        insert_project(&database, "Base Project", "C:\\Repos\\Base", true);
+        database
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+                    .map_err(|error| error.to_string())?;
+                let snapshot = ProjectSnapshot {
+                    name: "WAL Project".to_string(),
+                    path: "C:\\Repos\\Wal".to_string(),
+                    branch: "main".to_string(),
+                    git_status: "clean".to_string(),
+                    metadata_status: "fresh".to_string(),
+                    scripts: vec!["test".to_string()],
+                };
+                upsert_project(connection, &snapshot, None, false)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(database_sidecar(&source, "-wal").exists());
+
+        snapshot_backup_file(&source, &staged).unwrap();
+        let snapshot = validate_backup_file(&staged).unwrap();
+        assert!(snapshot.projects.iter().any(|project| project.name == "WAL Project"));
+    }
+
+    #[test]
     fn verified_restore_replaces_the_live_library() {
         let storage = TestDirectory::new("restore-success");
         let source = storage.0.join("source.sqlite3");
@@ -952,12 +993,9 @@ mod tests {
         fs::write(database_sidecar(&live, "-shm"), b"original shm").unwrap();
         let database = Database::unavailable(&live, "damaged library".to_string());
 
-        let error = restore_unavailable_database_with_verify(
-            &database,
-            &source,
-            &safety,
-            |_| Err("forced post-install verification failure".to_string()),
-        )
+        let error = restore_unavailable_database_with_verify(&database, &source, &safety, |_| {
+            Err("forced post-install verification failure".to_string())
+        })
         .unwrap_err();
         assert!(error.contains("forced post-install verification failure"));
         assert!(!database.is_available());
