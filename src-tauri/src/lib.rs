@@ -383,14 +383,12 @@ fn snapshot_backup_file(source: &Path, destination: &Path) -> Result<(), String>
         fs::create_dir_all(parent)
             .map_err(|_| "Launchpad could not create the restore staging folder.".to_string())?;
     }
-    let source_connection = rusqlite::Connection::open_with_flags(
-        source,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|error| {
-        eprintln!("Launchpad restore source open failed: {error}");
-        "That file is not a readable Launchpad backup.".to_string()
-    })?;
+    let source_connection =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+                eprintln!("Launchpad restore source open failed: {error}");
+                "That file is not a readable Launchpad backup.".to_string()
+            })?;
     backup_database(&source_connection, destination)?;
     drop(source_connection);
     validate_backup_file(destination).map(|_| ())
@@ -905,7 +903,10 @@ mod tests {
 
         snapshot_backup_file(&source, &staged).unwrap();
         let snapshot = validate_backup_file(&staged).unwrap();
-        assert!(snapshot.projects.iter().any(|project| project.name == "WAL Project"));
+        assert!(snapshot
+            .projects
+            .iter()
+            .any(|project| project.name == "WAL Project"));
     }
 
     #[test]
