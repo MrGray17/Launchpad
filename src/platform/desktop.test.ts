@@ -7,12 +7,14 @@ import {
   backupLibrary,
   bootstrapLibrary,
   chooseProjectFolder,
+  exportLibrary,
   isDesktopRuntime,
   openInCode,
   openTerminal,
   refreshProject,
   relinkProject,
   removeProject,
+  restoreLibrary,
   saveProjectFocus,
 } from "./desktop";
 
@@ -35,7 +37,7 @@ describe("desktop platform boundary", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
-  it("maps the reduced project API to exact native commands and id-based payloads", async () => {
+  it("maps the narrow project and recovery API to exact native commands", async () => {
     const legacy = [{ legacyId: "old", path: "C:\\repo", quest: "Ship" }];
     await bootstrapLibrary(legacy, "old");
     await addProject("C:\\repo");
@@ -47,6 +49,8 @@ describe("desktop platform boundary", () => {
     await openInCode(4);
     await openTerminal(4);
     await backupLibrary();
+    await exportLibrary();
+    await restoreLibrary();
 
     expect(native.invoke.mock.calls).toEqual([
       ["bootstrap", { projects: legacy, activeLegacyId: "old" }],
@@ -59,14 +63,18 @@ describe("desktop platform boundary", () => {
       ["open_in_vscode", { id: 4 }],
       ["open_terminal", { id: 4 }],
       ["backup_library", undefined],
+      ["export_library", undefined],
+      ["restore_library", undefined],
     ]);
   });
 
-  it("uses the public Tauri runtime API and configures one-directory picking", async () => {
+  it("uses the frontend dialog only for selecting project folders", async () => {
     native.open.mockResolvedValue("C:\\repo");
+
     expect(isDesktopRuntime()).toBe(true);
     await expect(chooseProjectFolder()).resolves.toBe("C:\\repo");
-    expect(native.isTauri).toHaveBeenCalled();
+
+    expect(native.open).toHaveBeenCalledOnce();
     expect(native.open).toHaveBeenCalledWith({ directory: true, multiple: false });
   });
 
@@ -78,6 +86,12 @@ describe("desktop platform boundary", () => {
     });
     await expect(chooseProjectFolder()).resolves.toBeNull();
     await expect(addProject("C:\\repo")).rejects.toThrow(
+      "This action is available in the Launchpad desktop app.",
+    );
+    await expect(exportLibrary()).rejects.toThrow(
+      "This action is available in the Launchpad desktop app.",
+    );
+    await expect(restoreLibrary()).rejects.toThrow(
       "This action is available in the Launchpad desktop app.",
     );
     expect(native.invoke).not.toHaveBeenCalled();

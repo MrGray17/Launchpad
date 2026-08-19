@@ -11,5 +11,7 @@ commands.allow = [
   "save_project_focus",
   "open_in_vscode",
   "open_terminal",
-  "backup_library"
+  "backup_library",
+  "export_library",
+  "restore_library"
 ]

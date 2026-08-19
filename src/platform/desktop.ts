@@ -118,3 +118,11 @@ export function openTerminal(id: number): Promise<Project> {
 export function backupLibrary(): Promise<BackupResult> {
   return invoke<BackupResult>("backup_library");
 }
+
+export function exportLibrary(): Promise<BackupResult | null> {
+  return invoke<BackupResult | null>("export_library");
+}
+
+export function restoreLibrary(): Promise<LibraryState | null> {
+  return invoke<LibraryState | null>("restore_library");
+}

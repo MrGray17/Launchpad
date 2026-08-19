@@ -1,5 +1,6 @@
 mod database;
 mod inspection;
+mod recovery;
 
 use database::{
     backup_database, finish_legacy_migration, legacy_migration_complete,
@@ -8,14 +9,17 @@ use database::{
     validate_legacy_project, Database, LegacyProject, LibraryState, Project,
 };
 use inspection::{canonical_project_path, inspect_project_path};
+use recovery::{restore_database, validate_backup_file, validate_library_connection};
 use serde::Serialize;
 use std::{
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
+use tauri_plugin_dialog::DialogExt;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -30,6 +34,13 @@ struct BootstrapState {
 #[serde(rename_all = "camelCase")]
 struct BackupResult {
     file_name: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RawDatabasePresence {
+    main: bool,
+    wal: bool,
+    shm: bool,
 }
 
 async fn run_blocking<T, F>(operation: F) -> Result<T, String>
@@ -53,6 +64,18 @@ where
     run_blocking(move || database.with_connection(operation)).await
 }
 
+fn hydrate_project_availability(mut project: Project) -> Project {
+    project.available = Path::new(&project.path).is_dir();
+    project
+}
+
+fn hydrate_library_availability(mut library: LibraryState) -> LibraryState {
+    for project in &mut library.projects {
+        project.available = Path::new(&project.path).is_dir();
+    }
+    library
+}
+
 fn refresh_project_record(
     database: &Database,
     id: i64,
@@ -61,9 +84,20 @@ fn refresh_project_record(
 ) -> Result<Project, String> {
     let path = database.with_connection(|connection| project_path(connection, id))?;
     let snapshot = inspect_project_path(path)?;
-    database.with_connection(|connection| {
+    let project = database.with_connection(|connection| {
         update_metadata(connection, id, &snapshot, make_active, mark_as_opened)
-    })
+    })?;
+    Ok(hydrate_project_availability(project))
+}
+
+fn refreshed_library(database: &Database) -> Result<LibraryState, String> {
+    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    let library = hydrate_library_availability(library);
+    if let Some(active_id) = library.active_project_id {
+        let _ = refresh_project_record(database, active_id, true, false);
+    }
+    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    Ok(hydrate_library_availability(library))
 }
 
 fn bootstrap_library(
@@ -98,11 +132,7 @@ fn bootstrap_library(
         }
     }
 
-    let library = database.with_connection(|connection| load_library_from_database(connection))?;
-    if let Some(active_id) = library.active_project_id {
-        let _ = refresh_project_record(database, active_id, true, false);
-    }
-    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    let library = refreshed_library(database)?;
     let migration_complete =
         database.with_connection(|connection| legacy_migration_complete(connection))?;
     Ok(BootstrapState {
@@ -127,10 +157,11 @@ async fn bootstrap(
 async fn add_project(path: String, database: State<'_, Database>) -> Result<Project, String> {
     let snapshot = run_blocking(move || inspect_project_path(path)).await?;
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let project = run_database(database, move |connection| {
         upsert_project(connection, &snapshot, None, true)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_project_availability(project))).await
 }
 
 #[tauri::command]
@@ -153,19 +184,21 @@ async fn relink_project(
 ) -> Result<Project, String> {
     let snapshot = run_blocking(move || inspect_project_path(path)).await?;
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let project = run_database(database, move |connection| {
         relink_in_database(connection, id, &snapshot)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_project_availability(project))).await
 }
 
 #[tauri::command]
 async fn remove_project(id: i64, database: State<'_, Database>) -> Result<LibraryState, String> {
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let library = run_database(database, move |connection| {
         remove_from_database(connection, id)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_library_availability(library))).await
 }
 
 #[tauri::command]
@@ -176,10 +209,11 @@ async fn save_project_focus(
     database: State<'_, Database>,
 ) -> Result<Project, String> {
     let database = database.inner().clone();
-    run_database(database, move |connection| {
+    let project = run_database(database, move |connection| {
         update_focus(connection, id, &quest, &checkpoint)
     })
-    .await
+    .await?;
+    run_blocking(move || Ok(hydrate_project_availability(project))).await
 }
 
 fn spawn_first_available(mut candidates: Vec<Command>, failure: &str) -> Result<(), String> {
@@ -196,24 +230,62 @@ fn spawn_first_available(mut candidates: Vec<Command>, failure: &str) -> Result<
     Err(failure.to_string())
 }
 
+#[cfg(target_os = "windows")]
+fn is_windows_executable(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+}
+
 fn editor_candidates(project_path: &Path) -> Vec<Command> {
     let mut candidates = Vec::new();
-    for executable in ["code.cmd", "code"] {
-        let mut command = Command::new(executable);
-        command.arg(project_path);
-        candidates.push(command);
-    }
+
     #[cfg(target_os = "windows")]
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let mut command = Command::new(
-            PathBuf::from(local_app_data)
-                .join("Programs")
-                .join("Microsoft VS Code")
-                .join("Code.exe"),
-        );
+    {
+        if let Some(explicit) = std::env::var_os("LAUNCHPAD_VSCODE") {
+            let explicit = PathBuf::from(explicit);
+            if is_windows_executable(&explicit) {
+                let mut command = Command::new(explicit);
+                command.arg(project_path);
+                candidates.push(command);
+            }
+        }
+
+        let mut from_path = Command::new("Code.exe");
+        from_path.arg(project_path);
+        candidates.push(from_path);
+
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let mut command = Command::new(
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Microsoft VS Code")
+                    .join("Code.exe"),
+            );
+            command.arg(project_path);
+            candidates.push(command);
+        }
+
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(program_files) = std::env::var_os(variable) {
+                let mut command = Command::new(
+                    PathBuf::from(program_files)
+                        .join("Microsoft VS Code")
+                        .join("Code.exe"),
+                );
+                command.arg(project_path);
+                candidates.push(command);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = Command::new("code");
         command.arg(project_path);
         candidates.push(command);
     }
+
     candidates
 }
 
@@ -257,15 +329,17 @@ fn open_project(database: &Database, id: i64, terminal: bool) -> Result<Project,
     if terminal {
         spawn_first_available(
             terminal_candidates(&canonical),
-            "No supported terminal could be opened. Install Windows Terminal, PowerShell, or another supported terminal.",
+            "No supported terminal could be opened. Install Windows Terminal or use PowerShell.",
         )?;
     } else {
         spawn_first_available(
             editor_candidates(&canonical),
-            "VS Code could not be opened. Install VS Code or enable its `code` command.",
+            "VS Code could not be opened. Install VS Code or set LAUNCHPAD_VSCODE to Code.exe.",
         )?;
     }
-    database.with_connection(|connection| update_metadata(connection, id, &snapshot, false, true))
+    let project = database
+        .with_connection(|connection| update_metadata(connection, id, &snapshot, false, true))?;
+    Ok(hydrate_project_availability(project))
 }
 
 #[tauri::command]
@@ -280,37 +354,459 @@ async fn open_terminal(id: i64, database: State<'_, Database>) -> Result<Project
     run_blocking(move || open_project(&database, id, true)).await
 }
 
+fn backup_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|_| "Launchpad could not locate its app-data folder.".to_string())
+        .map(|path| path.join("backups"))
+}
+
+fn timestamped_backup_name(prefix: &str) -> Result<String, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Launchpad could not timestamp the backup.".to_string())?
+        .as_nanos();
+    Ok(format!("{prefix}-{timestamp}.sqlite3"))
+}
+
+fn write_backup(database: &Database, path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create the backup destination.".to_string())?;
+    }
+    database.with_connection(|connection| backup_database(connection, path))
+}
+
+fn snapshot_backup_file(source: &Path, destination: &Path) -> Result<(), String> {
+    validate_backup_file(source)?;
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create the restore staging folder.".to_string())?;
+    }
+    let source_connection =
+        rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| {
+            eprintln!("Launchpad restore source open failed: {error}");
+            "That file is not a readable Launchpad backup.".to_string()
+        })?;
+    backup_database(&source_connection, destination)?;
+    drop(source_connection);
+    validate_backup_file(destination).map(|_| ())
+}
+
+fn same_file_path(first: &Path, second: &Path) -> bool {
+    if first == second {
+        return true;
+    }
+    match (fs::canonicalize(first), fs::canonicalize(second)) {
+        (Ok(first), Ok(second)) => first == second,
+        _ => false,
+    }
+}
+
+fn database_sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut value = OsString::from(path.as_os_str());
+    value.push(suffix);
+    PathBuf::from(value)
+}
+
+fn raw_database_pairs(source: &Path, destination: &Path) -> [(PathBuf, PathBuf); 3] {
+    [
+        (
+            database_sidecar(source, "-wal"),
+            database_sidecar(destination, "-wal"),
+        ),
+        (
+            database_sidecar(source, "-shm"),
+            database_sidecar(destination, "-shm"),
+        ),
+        (source.to_path_buf(), destination.to_path_buf()),
+    ]
+}
+
+fn copy_if_exists(source: &Path, destination: &Path) -> Result<bool, String> {
+    if !source.exists() {
+        return Ok(false);
+    }
+    fs::copy(source, destination)
+        .map(|_| true)
+        .map_err(|error| {
+            eprintln!("Launchpad recovery copy failed: {error}");
+            "Launchpad could not preserve its current library before recovery.".to_string()
+        })
+}
+
+fn remove_if_exists(path: &Path) -> Result<(), String> {
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::remove_file(path).map_err(|error| {
+        eprintln!("Launchpad recovery cleanup failed: {error}");
+        "Launchpad could not prepare its library files for recovery.".to_string()
+    })
+}
+
+fn copy_raw_database(source: &Path, destination: &Path) -> Result<RawDatabasePresence, String> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
+    }
+    let main = copy_if_exists(source, destination)?;
+    let wal = copy_if_exists(
+        &database_sidecar(source, "-wal"),
+        &database_sidecar(destination, "-wal"),
+    )?;
+    let shm = copy_if_exists(
+        &database_sidecar(source, "-shm"),
+        &database_sidecar(destination, "-shm"),
+    )?;
+    Ok(RawDatabasePresence { main, wal, shm })
+}
+
+fn clear_raw_database(path: &Path) -> Result<(), String> {
+    remove_if_exists(&database_sidecar(path, "-wal"))?;
+    remove_if_exists(&database_sidecar(path, "-shm"))?;
+    remove_if_exists(path)
+}
+
+fn move_raw_database_with<F>(
+    source: &Path,
+    destination: &Path,
+    mut rename: F,
+) -> Result<RawDatabasePresence, String>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let pairs = raw_database_pairs(source, destination);
+    if pairs
+        .iter()
+        .any(|(_, destination_file)| destination_file.exists())
+    {
+        return Err("Launchpad found an unexpected recovery quarantine collision.".to_string());
+    }
+
+    let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+    let mut presence = RawDatabasePresence {
+        main: false,
+        wal: false,
+        shm: false,
+    };
+
+    for (index, (source_file, destination_file)) in pairs.iter().enumerate() {
+        if !source_file.exists() {
+            continue;
+        }
+        if let Err(error) = rename(source_file, destination_file) {
+            eprintln!("Launchpad recovery quarantine move failed: {error}");
+            let mut rollback_failed = false;
+            for (original, quarantined) in moved.iter().rev() {
+                if let Err(rollback_error) = rename(quarantined, original) {
+                    eprintln!("Launchpad recovery quarantine rollback failed: {rollback_error}");
+                    rollback_failed = true;
+                }
+            }
+            return Err(if rollback_failed {
+                "Launchpad could not safely quarantine its library and could not fully undo the partial move. The safety backup was left untouched. Restart Launchpad before trying recovery again."
+                    .to_string()
+            } else {
+                "Launchpad could not safely quarantine its library. The original files were put back and the safety backup was left untouched."
+                    .to_string()
+            });
+        }
+
+        match index {
+            0 => presence.wal = true,
+            1 => presence.shm = true,
+            2 => presence.main = true,
+            _ => unreachable!(),
+        }
+        moved.push((source_file.clone(), destination_file.clone()));
+    }
+
+    Ok(presence)
+}
+
+fn move_raw_database(source: &Path, destination: &Path) -> Result<RawDatabasePresence, String> {
+    move_raw_database_with(source, destination, |from, to| fs::rename(from, to))
+}
+
+fn restore_with_rollback<F>(
+    connection: &mut rusqlite::Connection,
+    source: &Path,
+    safety_path: &Path,
+    verify_restored: F,
+) -> Result<LibraryState, String>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<LibraryState, String>,
+{
+    let attempt = restore_database(connection, source).and_then(|_| verify_restored(connection));
+    match attempt {
+        Ok(library) => Ok(library),
+        Err(restore_error) => {
+            let rollback = restore_database(connection, safety_path)
+                .and_then(|_| validate_library_connection(connection).map(|_| ()));
+            if let Err(rollback_error) = rollback {
+                eprintln!("Launchpad restore rollback failed: {rollback_error}");
+                return Err(
+                    "Restore failed and Launchpad could not automatically roll back. Keep the safety backup and restart Launchpad."
+                        .to_string(),
+                );
+            }
+            Err(restore_error)
+        }
+    }
+}
+
+fn restore_unavailable_database_with_verify<F>(
+    database: &Database,
+    source: &Path,
+    safety_path: &Path,
+    verify_restored: F,
+) -> Result<LibraryState, String>
+where
+    F: FnOnce(&Database) -> Result<LibraryState, String>,
+{
+    let original_error = database
+        .unavailable_error()
+        .ok_or_else(|| "Launchpad's library is already available.".to_string())?;
+    let live_path = database.path();
+    if same_file_path(source, &live_path) {
+        return Err("Choose a backup file other than Launchpad's live library.".to_string());
+    }
+
+    let live_parent = live_path
+        .parent()
+        .ok_or_else(|| "Launchpad could not locate its library folder.".to_string())?;
+    fs::create_dir_all(live_parent)
+        .map_err(|_| "Launchpad could not prepare its library folder for recovery.".to_string())?;
+    if let Some(parent) = safety_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
+    }
+
+    let stage_path = live_parent.join(timestamped_backup_name("launchpad-restore-stage")?);
+    if let Err(error) = snapshot_backup_file(source, &stage_path) {
+        let _ = clear_raw_database(&stage_path);
+        return Err(error);
+    }
+
+    let presence = copy_raw_database(&live_path, safety_path)?;
+    let quarantine_path =
+        live_parent.join(timestamped_backup_name("launchpad-recovery-quarantine")?);
+    let quarantined = match move_raw_database(&live_path, &quarantine_path) {
+        Ok(quarantined) => quarantined,
+        Err(error) => {
+            let _ = clear_raw_database(&stage_path);
+            return Err(error);
+        }
+    };
+    if quarantined != presence {
+        let rollback = move_raw_database(&quarantine_path, &live_path);
+        let _ = clear_raw_database(&stage_path);
+        if let Err(rollback_error) = rollback {
+            eprintln!("Launchpad recovery race rollback failed: {rollback_error}");
+            return Err(
+                "Launchpad's library files changed during recovery and could not be put back automatically. The safety backup is preserved. Restart Launchpad before trying again."
+                    .to_string(),
+            );
+        }
+        return Err(
+            "Launchpad's library files changed during recovery. Close any other program using the library and try again."
+                .to_string(),
+        );
+    }
+
+    let attempt = (|| {
+        database.mark_unavailable(original_error.clone())?;
+        fs::rename(&stage_path, &live_path).map_err(|error| {
+            eprintln!("Launchpad restore install failed: {error}");
+            "Launchpad could not install that backup safely.".to_string()
+        })?;
+        database.reopen()?;
+        verify_restored(database)
+    })();
+
+    match attempt {
+        Ok(library) => {
+            if let Err(error) = clear_raw_database(&quarantine_path) {
+                eprintln!("Launchpad recovery quarantine cleanup failed: {error}");
+            }
+            let _ = clear_raw_database(&stage_path);
+            Ok(library)
+        }
+        Err(restore_error) => {
+            let _ = database.mark_unavailable(original_error.clone());
+            let failed_path =
+                live_parent.join(timestamped_backup_name("launchpad-failed-restore")?);
+            if let Err(move_error) = move_raw_database(&live_path, &failed_path) {
+                eprintln!("Launchpad failed-restore quarantine failed: {move_error}");
+                let _ = clear_raw_database(&stage_path);
+                return Err(
+                    "Restore failed and Launchpad could not move the failed replacement out of the way. Your original library is still preserved in the recovery quarantine and safety backup. Restart Launchpad before trying again."
+                        .to_string(),
+                );
+            }
+
+            match move_raw_database(&quarantine_path, &live_path) {
+                Ok(restored_presence) if restored_presence == quarantined => {
+                    if let Err(error) = clear_raw_database(&failed_path) {
+                        eprintln!("Launchpad failed-restore cleanup failed: {error}");
+                    }
+                    let _ = clear_raw_database(&stage_path);
+                    Err(restore_error)
+                }
+                Ok(_) => {
+                    let _ = clear_raw_database(&stage_path);
+                    Err(
+                        "Restore failed and Launchpad could not verify that every original library file was put back. The safety backup is preserved; restart Launchpad before trying again."
+                            .to_string(),
+                    )
+                }
+                Err(rollback_error) => {
+                    eprintln!("Launchpad quarantine rollback failed: {rollback_error}");
+                    if let Err(failed_restore_error) = move_raw_database(&failed_path, &live_path) {
+                        eprintln!(
+                            "Launchpad could not put the failed replacement back either: {failed_restore_error}"
+                        );
+                    }
+                    let _ = clear_raw_database(&stage_path);
+                    Err(
+                        "Restore failed and Launchpad could not automatically put the original library back. The original files remain preserved in the recovery quarantine and safety backup. Restart Launchpad before trying again."
+                            .to_string(),
+                    )
+                }
+            }
+        }
+    }
+}
+
+fn restore_library_from_path(
+    database: &Database,
+    source: &Path,
+    safety_path: &Path,
+) -> Result<LibraryState, String> {
+    if same_file_path(source, &database.path()) {
+        return Err("Choose a backup file other than Launchpad's live library.".to_string());
+    }
+    validate_backup_file(source)?;
+    if let Some(parent) = safety_path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
+    }
+
+    if !database.is_available() {
+        let restored =
+            restore_unavailable_database_with_verify(database, source, safety_path, |database| {
+                database.with_connection(|connection| validate_library_connection(connection))
+            })?;
+        return Ok(hydrate_library_availability(restored));
+    }
+
+    let restored = database.with_connection(|connection| {
+        backup_database(connection, safety_path)?;
+        validate_backup_file(safety_path)?;
+        restore_with_rollback(connection, source, safety_path, validate_library_connection)
+    })?;
+    Ok(hydrate_library_availability(restored))
+}
+
 #[tauri::command]
 async fn backup_library(
     app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<BackupResult, String> {
-    let backup_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "Launchpad could not locate its app-data folder.".to_string())?
-        .join("backups");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "Launchpad could not timestamp the backup.".to_string())?
-        .as_nanos();
-    let file_name = format!("launchpad-backup-{timestamp}.sqlite3");
+    if !database.is_available() {
+        return Err(database
+            .unavailable_error()
+            .unwrap_or_else(|| "Launchpad's library is unavailable.".to_string()));
+    }
+    let backup_dir = backup_directory(&app)?;
+    let file_name = timestamped_backup_name("launchpad-backup")?;
     let path = backup_dir.join(&file_name);
     let database = database.inner().clone();
-    run_blocking(move || {
-        fs::create_dir_all(&backup_dir)
-            .map_err(|_| "Launchpad could not create its backup folder.".to_string())?;
-        database.with_connection(|connection| backup_database(connection, &path))
+    run_blocking(move || write_backup(&database, &path)).await?;
+    Ok(BackupResult { file_name })
+}
+
+#[tauri::command]
+async fn export_library(
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<Option<BackupResult>, String> {
+    if !database.is_available() {
+        return Err(database
+            .unavailable_error()
+            .unwrap_or_else(|| "Launchpad's library is unavailable.".to_string()));
+    }
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Export Launchpad backup")
+        .set_file_name("launchpad-backup.sqlite3")
+        .add_filter("Launchpad backup", &["sqlite3"])
+        .blocking_save_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let destination = selected
+        .into_path()
+        .map_err(|_| "Launchpad could not use that backup destination.".to_string())?;
+    if destination.is_dir() {
+        return Err("Choose a backup file, not a folder.".to_string());
+    }
+    if same_file_path(&destination, &database.path()) {
+        return Err("Choose a destination other than Launchpad's live library.".to_string());
+    }
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("launchpad-backup.sqlite3")
+        .to_string();
+    let database = database.inner().clone();
+    run_blocking(move || write_backup(&database, &destination)).await?;
+    Ok(Some(BackupResult { file_name }))
+}
+
+#[tauri::command]
+async fn restore_library(
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<Option<LibraryState>, String> {
+    let selected = app
+        .dialog()
+        .file()
+        .set_title("Restore Launchpad backup")
+        .add_filter("Launchpad backup", &["sqlite3"])
+        .blocking_pick_file();
+    let Some(selected) = selected else {
+        return Ok(None);
+    };
+    let source = selected
+        .into_path()
+        .map_err(|_| "Launchpad could not use that backup file.".to_string())?;
+    let backup_dir = backup_directory(&app)?;
+    let safety_name = timestamped_backup_name("launchpad-before-restore")?;
+    let safety_path = backup_dir.join(safety_name);
+    let database = database.inner().clone();
+    let restored = run_blocking({
+        let database = database.clone();
+        move || restore_library_from_path(&database, &source, &safety_path)
     })
     .await?;
-    Ok(BackupResult { file_name })
+    Ok(Some(restored))
 }
 
 fn initialize_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
     let app_data_dir = app.path().app_data_dir()?;
     fs::create_dir_all(&app_data_dir)?;
-    Database::open(&app_data_dir.join("launchpad.sqlite3"))
-        .map_err(|error| std::io::Error::other(error).into())
+    let database_path = app_data_dir.join("launchpad.sqlite3");
+    Ok(match Database::open(&database_path) {
+        Ok(database) => database,
+        Err(error) => {
+            eprintln!("Launchpad entered library recovery mode: {error}");
+            Database::unavailable(&database_path, error)
+        }
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -339,7 +835,9 @@ pub fn run() {
             save_project_focus,
             open_in_vscode,
             open_terminal,
-            backup_library
+            backup_library,
+            export_library,
+            restore_library
         ])
         .run(tauri::generate_context!())
         .expect("error while running Launchpad");
@@ -348,6 +846,7 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::inspection::ProjectSnapshot;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     struct TestDirectory(PathBuf);
@@ -369,6 +868,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn insert_project(database: &Database, name: &str, path: &str, make_active: bool) {
+        database
+            .with_connection(|connection| {
+                let snapshot = ProjectSnapshot {
+                    name: name.to_string(),
+                    path: path.to_string(),
+                    branch: "main".to_string(),
+                    git_status: "clean".to_string(),
+                    metadata_status: "fresh".to_string(),
+                    scripts: vec!["build".to_string()],
+                };
+                upsert_project(connection, &snapshot, None, make_active)?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn create_library_file(path: &Path, name: &str) {
+        let database = Database::open(path).unwrap();
+        insert_project(&database, name, &format!("C:\\Repos\\{name}"), true);
     }
 
     #[test]
@@ -421,5 +942,214 @@ mod tests {
         assert_eq!(state.projects.len(), 1);
         assert_eq!(state.active_project_id, Some(state.projects[0].id));
         assert_eq!(state.projects[0].quest, "Keep this quest");
+    }
+
+    #[test]
+    fn database_reads_do_not_probe_the_filesystem_while_locked() {
+        let existing = TestDirectory::new("availability-existing");
+        let storage = TestDirectory::new("availability-database");
+        let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
+        insert_project(&database, "Existing", &existing.0.to_string_lossy(), true);
+        insert_project(
+            &database,
+            "Missing",
+            &storage.0.join("missing").to_string_lossy(),
+            false,
+        );
+
+        let persisted = database
+            .with_connection(|connection| load_library_from_database(connection))
+            .unwrap();
+        assert!(persisted.projects.iter().all(|project| !project.available));
+
+        let hydrated = hydrate_library_availability(persisted);
+        assert!(hydrated
+            .projects
+            .iter()
+            .find(|project| project.name == "Existing")
+            .is_some_and(|project| project.available));
+        assert!(hydrated
+            .projects
+            .iter()
+            .find(|project| project.name == "Missing")
+            .is_some_and(|project| !project.available));
+    }
+
+    #[test]
+    fn snapshot_backup_file_includes_committed_wal_state() {
+        let storage = TestDirectory::new("wal-snapshot");
+        let source = storage.0.join("source.sqlite3");
+        let staged = storage.0.join("staged.sqlite3");
+        let database = Database::open(&source).unwrap();
+        insert_project(&database, "Base Project", "C:\\Repos\\Base", true);
+        database
+            .with_connection(|connection| {
+                connection
+                    .execute_batch("PRAGMA wal_autocheckpoint = 0;")
+                    .map_err(|error| error.to_string())?;
+                let snapshot = ProjectSnapshot {
+                    name: "WAL Project".to_string(),
+                    path: "C:\\Repos\\Wal".to_string(),
+                    branch: "main".to_string(),
+                    git_status: "clean".to_string(),
+                    metadata_status: "fresh".to_string(),
+                    scripts: vec!["test".to_string()],
+                };
+                upsert_project(connection, &snapshot, None, false)?;
+                Ok(())
+            })
+            .unwrap();
+        assert!(database_sidecar(&source, "-wal").exists());
+
+        snapshot_backup_file(&source, &staged).unwrap();
+        let snapshot = validate_backup_file(&staged).unwrap();
+        assert!(snapshot
+            .projects
+            .iter()
+            .any(|project| project.name == "WAL Project"));
+    }
+
+    #[test]
+    fn raw_quarantine_rolls_back_a_partial_move_failure() {
+        let storage = TestDirectory::new("quarantine-partial-failure");
+        let source = storage.0.join("live.sqlite3");
+        let quarantine = storage.0.join("quarantine.sqlite3");
+        fs::write(&source, b"main").unwrap();
+        fs::write(database_sidecar(&source, "-wal"), b"wal").unwrap();
+        fs::write(database_sidecar(&source, "-shm"), b"shm").unwrap();
+
+        let mut calls = 0;
+        let error = move_raw_database_with(&source, &quarantine, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                Err(std::io::Error::other("forced rename failure"))
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.contains("original files were put back"));
+        assert_eq!(fs::read(&source).unwrap(), b"main");
+        assert_eq!(fs::read(database_sidecar(&source, "-wal")).unwrap(), b"wal");
+        assert_eq!(fs::read(database_sidecar(&source, "-shm")).unwrap(), b"shm");
+        assert!(!quarantine.exists());
+        assert!(!database_sidecar(&quarantine, "-wal").exists());
+        assert!(!database_sidecar(&quarantine, "-shm").exists());
+    }
+
+    #[test]
+    fn verified_restore_replaces_the_live_library() {
+        let storage = TestDirectory::new("restore-success");
+        let source = storage.0.join("source.sqlite3");
+        let live = storage.0.join("live.sqlite3");
+        let safety = storage.0.join("safety.sqlite3");
+        create_library_file(&source, "Restored Project");
+        let database = Database::open(&live).unwrap();
+        insert_project(&database, "Original Project", "C:\\Repos\\Original", true);
+
+        let restored = restore_library_from_path(&database, &source, &safety).unwrap();
+        assert_eq!(restored.projects.len(), 1);
+        assert_eq!(restored.projects[0].name, "Restored Project");
+        let persisted = database
+            .with_connection(|connection| load_library_from_database(connection))
+            .unwrap();
+        assert_eq!(persisted.projects[0].name, "Restored Project");
+    }
+
+    #[test]
+    fn post_restore_verification_failure_rolls_back_the_live_library() {
+        let storage = TestDirectory::new("restore-rollback");
+        let source = storage.0.join("source.sqlite3");
+        let live = storage.0.join("live.sqlite3");
+        let safety = storage.0.join("safety.sqlite3");
+        create_library_file(&source, "Restored Project");
+        let database = Database::open(&live).unwrap();
+        insert_project(&database, "Original Project", "C:\\Repos\\Original", true);
+
+        let error = database
+            .with_connection(|connection| {
+                backup_database(connection, &safety)?;
+                validate_backup_file(&safety)?;
+                restore_with_rollback(connection, &source, &safety, |_| {
+                    Err("forced post-restore verification failure".to_string())
+                })
+            })
+            .unwrap_err();
+        assert!(error.contains("forced post-restore verification failure"));
+
+        let rolled_back = database
+            .with_connection(|connection| load_library_from_database(connection))
+            .unwrap();
+        assert_eq!(rolled_back.projects.len(), 1);
+        assert_eq!(rolled_back.projects[0].name, "Original Project");
+    }
+
+    #[test]
+    fn unavailable_restore_preserves_raw_files_and_recovers() {
+        let storage = TestDirectory::new("unavailable-restore");
+        let source = storage.0.join("source.sqlite3");
+        let live = storage.0.join("live.sqlite3");
+        let safety = storage.0.join("safety.sqlite3");
+        create_library_file(&source, "Recovered Project");
+        fs::write(&live, b"broken live database").unwrap();
+        fs::write(database_sidecar(&live, "-wal"), b"broken wal").unwrap();
+        fs::write(database_sidecar(&live, "-shm"), b"broken shm").unwrap();
+        let database = Database::unavailable(&live, "damaged library".to_string());
+
+        let restored = restore_library_from_path(&database, &source, &safety).unwrap();
+        assert!(database.is_available());
+        assert_eq!(restored.projects[0].name, "Recovered Project");
+        assert_eq!(fs::read(&safety).unwrap(), b"broken live database");
+        assert_eq!(
+            fs::read(database_sidecar(&safety, "-wal")).unwrap(),
+            b"broken wal"
+        );
+        assert_eq!(
+            fs::read(database_sidecar(&safety, "-shm")).unwrap(),
+            b"broken shm"
+        );
+    }
+
+    #[test]
+    fn unavailable_restore_rolls_back_raw_files_after_post_install_failure() {
+        let storage = TestDirectory::new("unavailable-rollback");
+        let source = storage.0.join("source.sqlite3");
+        let live = storage.0.join("live.sqlite3");
+        let safety = storage.0.join("safety.sqlite3");
+        create_library_file(&source, "Recovered Project");
+        fs::write(&live, b"original broken database").unwrap();
+        fs::write(database_sidecar(&live, "-wal"), b"original wal").unwrap();
+        fs::write(database_sidecar(&live, "-shm"), b"original shm").unwrap();
+        let database = Database::unavailable(&live, "damaged library".to_string());
+
+        let error = restore_unavailable_database_with_verify(&database, &source, &safety, |_| {
+            Err("forced post-install verification failure".to_string())
+        })
+        .unwrap_err();
+        assert!(error.contains("forced post-install verification failure"));
+        assert!(!database.is_available());
+        assert_eq!(fs::read(&live).unwrap(), b"original broken database");
+        assert_eq!(
+            fs::read(database_sidecar(&live, "-wal")).unwrap(),
+            b"original wal"
+        );
+        assert_eq!(
+            fs::read(database_sidecar(&live, "-shm")).unwrap(),
+            b"original shm"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn vscode_candidates_never_use_shell_script_shims() {
+        let project = Path::new("C:\\repo");
+        assert!(editor_candidates(project).iter().all(|command| {
+            !command
+                .get_program()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".cmd")
+        }));
     }
 }

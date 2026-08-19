@@ -2,7 +2,7 @@ use crate::inspection::ProjectSnapshot;
 use rusqlite::{ffi::ErrorCode, params, Connection, OptionalExtension, Row, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
 
@@ -14,8 +14,16 @@ const PROJECT_COLUMNS: &str = "
     created_at, updated_at, last_opened_at, metadata_refreshed_at
 ";
 
+enum DatabaseState {
+    Ready(Connection),
+    Unavailable(String),
+}
+
 #[derive(Clone)]
-pub(crate) struct Database(Arc<Mutex<Connection>>);
+pub(crate) struct Database {
+    path: Arc<PathBuf>,
+    state: Arc<Mutex<DatabaseState>>,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -55,29 +63,87 @@ pub(crate) struct LibraryState {
     pub(crate) active_project_id: Option<i64>,
 }
 
+fn open_connection(path: &Path) -> Result<Connection, String> {
+    let mut connection = Connection::open(path).map_err(database_error)?;
+    migrate(&mut connection)?;
+    Ok(connection)
+}
+
 impl Database {
     pub(crate) fn open(path: &Path) -> Result<Self, String> {
-        let mut connection = Connection::open(path).map_err(database_error)?;
-        migrate(&mut connection)?;
-        Ok(Self(Arc::new(Mutex::new(connection))))
+        let connection = open_connection(path)?;
+        Ok(Self {
+            path: Arc::new(path.to_path_buf()),
+            state: Arc::new(Mutex::new(DatabaseState::Ready(connection))),
+        })
+    }
+
+    pub(crate) fn unavailable(path: &Path, error: String) -> Self {
+        Self {
+            path: Arc::new(path.to_path_buf()),
+            state: Arc::new(Mutex::new(DatabaseState::Unavailable(error))),
+        }
+    }
+
+    pub(crate) fn path(&self) -> PathBuf {
+        self.path.as_ref().clone()
+    }
+
+    pub(crate) fn is_available(&self) -> bool {
+        self.state
+            .lock()
+            .map(|state| matches!(&*state, DatabaseState::Ready(_)))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn unavailable_error(&self) -> Option<String> {
+        self.state.lock().ok().and_then(|state| match &*state {
+            DatabaseState::Ready(_) => None,
+            DatabaseState::Unavailable(error) => Some(error.clone()),
+        })
+    }
+
+    pub(crate) fn mark_unavailable(&self, error: String) -> Result<(), String> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Launchpad's local library is temporarily unavailable.".to_string())?;
+        *state = DatabaseState::Unavailable(error);
+        Ok(())
+    }
+
+    pub(crate) fn reopen(&self) -> Result<(), String> {
+        let connection = open_connection(self.path.as_ref())?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| "Launchpad's local library is temporarily unavailable.".to_string())?;
+        *state = DatabaseState::Ready(connection);
+        Ok(())
     }
 
     #[cfg(test)]
     fn in_memory() -> Self {
         let mut connection = Connection::open_in_memory().expect("in-memory database should open");
         migrate(&mut connection).expect("in-memory database should migrate");
-        Self(Arc::new(Mutex::new(connection)))
+        Self {
+            path: Arc::new(PathBuf::from(":memory:")),
+            state: Arc::new(Mutex::new(DatabaseState::Ready(connection))),
+        }
     }
 
     pub(crate) fn with_connection<T>(
         &self,
         operation: impl FnOnce(&mut Connection) -> Result<T, String>,
     ) -> Result<T, String> {
-        let mut connection = self
-            .0
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| "Launchpad's local library is temporarily unavailable.".to_string())?;
-        operation(&mut connection)
+        match &mut *state {
+            DatabaseState::Ready(connection) => operation(connection),
+            DatabaseState::Unavailable(error) => Err(error.clone()),
+        }
     }
 }
 
@@ -178,7 +244,8 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
-        available: Path::new(&path).is_dir(),
+        // Filesystem availability is hydrated after the SQLite mutex is released.
+        available: false,
         path,
         branch: row.get(3)?,
         git_status: row.get(4)?,
@@ -569,6 +636,24 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn unavailable_database_keeps_its_error_until_reopened() {
+        let storage = TestDatabase::new("unavailable");
+        let database = Database::unavailable(&storage.path, "broken library".to_string());
+        assert!(!database.is_available());
+        assert_eq!(
+            database.unavailable_error().as_deref(),
+            Some("broken library")
+        );
+        assert!(database.with_connection(|_| Ok(())).is_err());
+
+        let healthy = Database::open(&storage.path).unwrap();
+        drop(healthy);
+        database.reopen().unwrap();
+        assert!(database.is_available());
+        assert!(database.unavailable_error().is_none());
     }
 
     #[test]

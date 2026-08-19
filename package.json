@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "packageManager": "npm@11.6.0",
   "engines": {
-    "node": ">=22.12 <23"
+    "node": ">=22.22.2 <23"
   },
   "type": "module",
   "scripts": {
