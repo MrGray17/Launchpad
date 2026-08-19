@@ -1,17 +1,28 @@
+import { invoke as tauriInvoke, isTauri } from "@tauri-apps/api/core";
+
 export type GitStatus = "clean" | "dirty" | "unknown";
+export type MetadataStatus =
+  | "fresh"
+  | "unknown"
+  | "not-a-repository"
+  | "git-unavailable"
+  | "invalid-repository"
+  | "timeout";
 
 export type Project = {
   id: number;
   name: string;
-  path: string;
   branch: string;
   gitStatus: GitStatus;
+  metadataStatus: MetadataStatus;
   scripts: string[];
   quest: string;
   checkpoint: string;
   createdAt: string;
   updatedAt: string;
   lastOpenedAt: string | null;
+  metadataRefreshedAt: string | null;
+  available: boolean;
 };
 
 export type LibraryState = {
@@ -20,20 +31,29 @@ export type LibraryState = {
 };
 
 export type LegacyProject = {
+  legacyId: string;
   path: string;
   quest?: string;
   checkpoint?: string;
 };
 
+export type BootstrapState = LibraryState & {
+  pendingLegacyIds: string[];
+  legacyMigrationComplete: boolean;
+};
+
+export type BackupResult = {
+  fileName: string;
+};
+
 export function isDesktopRuntime() {
-  return "__TAURI_INTERNALS__" in window;
+  return isTauri();
 }
 
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   if (!isDesktopRuntime()) {
     throw new Error("This action is available in the Launchpad desktop app.");
   }
-  const { invoke: tauriInvoke } = await import("@tauri-apps/api/core");
   return tauriInvoke<T>(command, args);
 }
 
@@ -44,15 +64,19 @@ export async function chooseProjectFolder(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
-export function loadLibrary(): Promise<LibraryState> {
+export function bootstrapLibrary(
+  projects: LegacyProject[],
+  activeLegacyId: string | null,
+): Promise<BootstrapState> {
   if (!isDesktopRuntime()) {
-    return Promise.resolve({ projects: [], activeProjectId: null });
+    return Promise.resolve({
+      projects: [],
+      activeProjectId: null,
+      pendingLegacyIds: [],
+      legacyMigrationComplete: true,
+    });
   }
-  return invoke<LibraryState>("load_library");
-}
-
-export function importLegacyProjects(projects: LegacyProject[]): Promise<LibraryState> {
-  return invoke<LibraryState>("import_legacy_projects", { projects });
+  return invoke<BootstrapState>("bootstrap", { projects, activeLegacyId });
 }
 
 export function addProject(path: string): Promise<Project> {
@@ -61,6 +85,18 @@ export function addProject(path: string): Promise<Project> {
 
 export function activateProject(id: number): Promise<Project> {
   return invoke<Project>("activate_project", { id });
+}
+
+export function refreshProject(id: number): Promise<Project> {
+  return invoke<Project>("refresh_project", { id });
+}
+
+export function relinkProject(id: number, path: string): Promise<Project> {
+  return invoke<Project>("relink_project", { id, path });
+}
+
+export function removeProject(id: number): Promise<LibraryState> {
+  return invoke<LibraryState>("remove_project", { id });
 }
 
 export function saveProjectFocus(
@@ -75,6 +111,10 @@ export function openInCode(id: number): Promise<Project> {
   return invoke<Project>("open_in_vscode", { id });
 }
 
-export function openTerminal(id: number): Promise<void> {
-  return invoke<void>("open_terminal", { id });
+export function openTerminal(id: number): Promise<Project> {
+  return invoke<Project>("open_terminal", { id });
+}
+
+export function backupLibrary(): Promise<BackupResult> {
+  return invoke<BackupResult>("backup_library");
 }

@@ -1,0 +1,15 @@
+[[permission]]
+identifier = "allow-launchpad-commands"
+description = "Allows the main Launchpad window to manage its local project library."
+commands.allow = [
+  "bootstrap",
+  "add_project",
+  "activate_project",
+  "refresh_project",
+  "relink_project",
+  "remove_project",
+  "save_project_focus",
+  "open_in_vscode",
+  "open_terminal",
+  "backup_library"
+]

@@ -25,11 +25,14 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v5
         with:
-          node-version: 22
+          node-version: 22.22.0
           cache: npm
 
-      - name: Set up stable Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Pin npm
+        run: npm install --global npm@11.6.0
+
+      - name: Set up pinned Rust
+        uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: clippy, rustfmt
 
@@ -58,6 +61,10 @@ jobs:
 
       - name: Build Windows installers
         run: npm run tauri build
+
+      - name: Smoke-test release executable
+        shell: powershell
+        run: ./scripts/smoke-release.ps1
 
       - name: Upload installer evidence
         uses: actions/upload-artifact@v4

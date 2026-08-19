@@ -4,76 +4,78 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activateProject,
   addProject,
+  backupLibrary,
+  bootstrapLibrary,
   chooseProjectFolder,
-  importLegacyProjects,
   isDesktopRuntime,
-  loadLibrary,
   openInCode,
   openTerminal,
+  refreshProject,
+  relinkProject,
+  removeProject,
   saveProjectFocus,
 } from "./desktop";
 
 const native = vi.hoisted(() => ({
   invoke: vi.fn(),
+  isTauri: vi.fn(() => true),
   open: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke, isTauri: native.isTauri }));
 vi.mock("@tauri-apps/plugin-dialog", () => ({ open: native.open }));
-
-function enableDesktopRuntime() {
-  Object.defineProperty(window, "__TAURI_INTERNALS__", {
-    configurable: true,
-    value: {},
-  });
-}
-
-function disableDesktopRuntime() {
-  Reflect.deleteProperty(window, "__TAURI_INTERNALS__");
-}
 
 describe("desktop platform boundary", () => {
   beforeEach(() => {
     vi.clearAllMocks();
-    enableDesktopRuntime();
+    native.isTauri.mockReturnValue(true);
     native.invoke.mockResolvedValue(undefined);
     native.open.mockResolvedValue(null);
   });
 
-  afterEach(disableDesktopRuntime);
+  afterEach(() => vi.restoreAllMocks());
 
-  it("maps every library operation to its exact native command and payload", async () => {
-    await loadLibrary();
-    await importLegacyProjects([{ path: "C:\\repo", quest: "Ship" }]);
+  it("maps the reduced project API to exact native commands and id-based payloads", async () => {
+    const legacy = [{ legacyId: "old", path: "C:\\repo", quest: "Ship" }];
+    await bootstrapLibrary(legacy, "old");
     await addProject("C:\\repo");
     await activateProject(4);
+    await refreshProject(4);
+    await relinkProject(4, "D:\\repo");
+    await removeProject(4);
     await saveProjectFocus(4, "Ship", "Run the tests");
     await openInCode(4);
     await openTerminal(4);
+    await backupLibrary();
 
     expect(native.invoke.mock.calls).toEqual([
-      ["load_library", undefined],
-      ["import_legacy_projects", { projects: [{ path: "C:\\repo", quest: "Ship" }] }],
+      ["bootstrap", { projects: legacy, activeLegacyId: "old" }],
       ["add_project", { path: "C:\\repo" }],
       ["activate_project", { id: 4 }],
+      ["refresh_project", { id: 4 }],
+      ["relink_project", { id: 4, path: "D:\\repo" }],
+      ["remove_project", { id: 4 }],
       ["save_project_focus", { id: 4, quest: "Ship", checkpoint: "Run the tests" }],
       ["open_in_vscode", { id: 4 }],
       ["open_terminal", { id: 4 }],
+      ["backup_library", undefined],
     ]);
   });
 
-  it("configures the native folder picker for one directory", async () => {
+  it("uses the public Tauri runtime API and configures one-directory picking", async () => {
     native.open.mockResolvedValue("C:\\repo");
-
+    expect(isDesktopRuntime()).toBe(true);
     await expect(chooseProjectFolder()).resolves.toBe("C:\\repo");
+    expect(native.isTauri).toHaveBeenCalled();
     expect(native.open).toHaveBeenCalledWith({ directory: true, multiple: false });
   });
 
   it("keeps browser preview read-only and never attempts native IPC", async () => {
-    disableDesktopRuntime();
-
+    native.isTauri.mockReturnValue(false);
     expect(isDesktopRuntime()).toBe(false);
-    await expect(loadLibrary()).resolves.toEqual({ projects: [], activeProjectId: null });
+    await expect(bootstrapLibrary([], null)).resolves.toEqual({
+      projects: [], activeProjectId: null, pendingLegacyIds: [], legacyMigrationComplete: true,
+    });
     await expect(chooseProjectFolder()).resolves.toBeNull();
     await expect(addProject("C:\\repo")).rejects.toThrow(
       "This action is available in the Launchpad desktop app.",

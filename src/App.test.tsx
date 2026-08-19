@@ -1,19 +1,24 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { LibraryState, Project } from "./platform/desktop";
+import type { BootstrapState, LibraryState, Project } from "./platform/desktop";
+import { THEME_STORAGE_KEY } from "./theme";
 
 const desktop = vi.hoisted(() => ({
   activateProject: vi.fn(),
   addProject: vi.fn(),
+  backupLibrary: vi.fn(),
+  bootstrapLibrary: vi.fn(),
   chooseProjectFolder: vi.fn(),
-  importLegacyProjects: vi.fn(),
   isDesktopRuntime: vi.fn(() => true),
-  loadLibrary: vi.fn(),
   openInCode: vi.fn(),
   openTerminal: vi.fn(),
+  refreshProject: vi.fn(),
+  relinkProject: vi.fn(),
+  removeProject: vi.fn(),
   saveProjectFocus: vi.fn(),
 }));
 
@@ -22,187 +27,229 @@ vi.mock("./platform/desktop", () => desktop);
 const project: Project = {
   id: 7,
   name: "Rate Limiter",
-  path: "\\\\?\\C:\\Users\\vPro\\rate-limiter",
-  branch: "master",
+  branch: "main",
   gitStatus: "clean",
+  metadataStatus: "fresh",
   scripts: ["build", "test"],
   quest: "Prove the token bucket",
   checkpoint: "Add the burst capacity regression test.",
   createdAt: "2026-08-18T10:00:00.000Z",
   updatedAt: "2026-08-18T10:00:00.000Z",
   lastOpenedAt: null,
+  metadataRefreshedAt: "2026-08-19T10:00:00.000Z",
+  available: true,
 };
-
-const library: LibraryState = { projects: [project], activeProjectId: project.id };
 const secondProject: Project = {
   ...project,
   id: 8,
   name: "Compiler Lab",
-  path: "C:\\CompilerLab",
   branch: "feat/parser",
   gitStatus: "dirty",
   quest: "Finish the parser",
 };
+const bootstrap: BootstrapState = {
+  projects: [project],
+  activeProjectId: project.id,
+  pendingLegacyIds: [],
+  legacyMigrationComplete: true,
+};
 
-describe("Launchpad project flow", () => {
+describe("Launchpad hardened project lifecycle", () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    vi.spyOn(window, "confirm").mockReturnValue(true);
     desktop.isDesktopRuntime.mockReturnValue(true);
-    desktop.loadLibrary.mockResolvedValue(library);
-    desktop.importLegacyProjects.mockResolvedValue(library);
+    desktop.bootstrapLibrary.mockResolvedValue(bootstrap);
     desktop.chooseProjectFolder.mockResolvedValue(null);
-    desktop.addProject.mockResolvedValue(project);
     desktop.activateProject.mockResolvedValue(project);
+    desktop.addProject.mockResolvedValue(project);
+    desktop.refreshProject.mockResolvedValue(project);
+    desktop.relinkProject.mockResolvedValue(project);
+    desktop.removeProject.mockResolvedValue({ projects: [], activeProjectId: null });
     desktop.saveProjectFocus.mockResolvedValue(project);
-    desktop.openTerminal.mockResolvedValue(undefined);
-    desktop.openInCode.mockResolvedValue({ ...project, lastOpenedAt: "2026-08-19T10:00:00.000Z" });
+    desktop.openInCode.mockResolvedValue({ ...project, lastOpenedAt: "2026-08-19T11:00:00.000Z" });
+    desktop.openTerminal.mockResolvedValue({ ...project, lastOpenedAt: "2026-08-19T11:00:00.000Z" });
+    desktop.backupLibrary.mockResolvedValue({ fileName: "launchpad-backup-123.sqlite3" });
   });
 
-  afterEach(cleanup);
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
 
-  it("loads the native library and launches project actions by database id", async () => {
+  it("bootstraps once under Strict Mode and renders refreshed metadata", async () => {
+    render(<StrictMode><App /></StrictMode>);
+    expect(await screen.findByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
+    expect(desktop.bootstrapLibrary).toHaveBeenCalledOnce();
+    expect(desktop.bootstrapLibrary).toHaveBeenCalledWith([], null);
+    expect(document.querySelector(".git-line")?.textContent).toContain("main");
+  });
+
+  it("keeps the original light theme and persists the optional dark-grey theme", async () => {
+    const first = render(<App />);
+    const darkToggle = await screen.findByRole("button", { name: "Switch to dark grey theme" });
+    expect(document.documentElement.dataset.theme).toBe("light");
+    fireEvent.click(darkToggle);
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+    expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
+
+    first.unmount();
     render(<App />);
+    expect(await screen.findByRole("button", { name: "Switch to light theme" })).toBeTruthy();
+  });
 
+  it("opens editor and terminal by id and applies returned timestamps", async () => {
+    render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /Continue Rate Limiter/ }));
     await waitFor(() => expect(desktop.openInCode).toHaveBeenCalledWith(7));
-
     fireEvent.click(screen.getByRole("button", { name: "Open terminal" }));
     await waitFor(() => expect(desktop.openTerminal).toHaveBeenCalledWith(7));
-    expect(document.querySelector(".git-line")?.textContent).toContain("master");
-    expect(screen.getByText("build · test")).toBeTruthy();
   });
 
-  it("adds a folder through the native duplicate-safe project command", async () => {
-    const added = { ...project, id: 12, name: "Launchpad", path: "C:\\Launchpad" };
-    desktop.chooseProjectFolder.mockResolvedValue("C:\\Launchpad");
-    desktop.addProject.mockResolvedValue(added);
-
+  it("uses one global operation lock to prevent overlapping actions", async () => {
+    let resolveFolder: (path: string | null) => void = () => undefined;
+    desktop.chooseProjectFolder.mockReturnValue(new Promise((resolve) => { resolveFolder = resolve; }));
     render(<App />);
     fireEvent.click(await screen.findByRole("button", { name: /^Add project/ }));
+    const continueButton = screen.getByRole("button", { name: /Continue Rate Limiter/ });
+    expect(continueButton).toHaveProperty("disabled", true);
+    fireEvent.click(continueButton);
+    expect(desktop.openInCode).not.toHaveBeenCalled();
+    resolveFolder(null);
+    await waitFor(() => expect(continueButton).toHaveProperty("disabled", false));
+  });
 
+  it("adds a real folder through the native upsert", async () => {
+    const added = { ...secondProject, id: 12, name: "Launchpad" };
+    desktop.chooseProjectFolder.mockResolvedValue("C:\\Launchpad");
+    desktop.addProject.mockResolvedValue(added);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: /^Add project/ }));
     expect(await screen.findByRole("button", { name: /Continue Launchpad/ })).toBeTruthy();
     expect(desktop.addProject).toHaveBeenCalledWith("C:\\Launchpad");
   });
 
-  it("saves both quest and checkpoint through SQLite", async () => {
-    const updated = {
-      ...project,
-      quest: "Ship the token bucket",
-      checkpoint: "Capacity and refill tests are next.",
-    };
-    desktop.saveProjectFocus.mockResolvedValue(updated);
-
+  it("activates through one native operation and preserves selection on failure", async () => {
+    desktop.bootstrapLibrary.mockResolvedValue({ ...bootstrap, projects: [project, secondProject] });
+    desktop.activateProject.mockRejectedValueOnce("That project folder does not exist.");
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Edit focus/ }));
-    fireEvent.change(screen.getByLabelText("Current quest"), { target: { value: updated.quest } });
-    fireEvent.change(screen.getByLabelText("Checkpoint"), { target: { value: updated.checkpoint } });
-    fireEvent.click(screen.getByRole("button", { name: /Save focus/ }));
-
-    await waitFor(() => expect(desktop.saveProjectFocus).toHaveBeenCalledWith(
-      7,
-      updated.quest,
-      updated.checkpoint,
-    ));
-    expect(await screen.findByText(updated.quest)).toBeTruthy();
-  });
-
-  it("imports real legacy paths once and removes prototype storage", async () => {
-    localStorage.setItem("launchpad.projects.v1", JSON.stringify([
-      { name: "Decorative sample" },
-      { path: "C:\\real-project", quest: "Keep this quest", checkpoint: "Keep this note" },
-    ]));
-    localStorage.setItem("launchpad.active-project.v1", "old-id");
-
-    render(<App />);
-
-    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
-    expect(desktop.importLegacyProjects).toHaveBeenCalledWith([
-      { path: "C:\\real-project", quest: "Keep this quest", checkpoint: "Keep this note" },
-    ]);
-    expect(localStorage.getItem("launchpad.projects.v1")).toBeNull();
-    expect(localStorage.getItem("launchpad.active-project.v1")).toBeNull();
-  });
-
-  it("shows an honest empty state without seeded showcase projects", async () => {
-    desktop.loadLibrary.mockResolvedValue({ projects: [], activeProjectId: null });
-    render(<App />);
-
-    expect(await screen.findByRole("button", { name: "Choose a project folder" })).toBeTruthy();
-    expect(screen.queryByText("Sifr")).toBeNull();
-    expect(screen.queryByText("Maw3id")).toBeNull();
-  });
-
-  it("recovers from a library load failure without restarting the app", async () => {
-    desktop.loadLibrary.mockRejectedValueOnce("The database is temporarily locked.");
-    render(<App />);
-
-    expect((await screen.findByRole("alert")).textContent).toContain("temporarily locked");
-    desktop.loadLibrary.mockResolvedValue(library);
-    fireEvent.click(screen.getByRole("button", { name: "Try again" }));
-
-    expect(await screen.findByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
-    expect(desktop.loadLibrary).toHaveBeenCalledTimes(2);
-  });
-
-  it("persists selection and refreshes repository metadata", async () => {
-    desktop.loadLibrary.mockResolvedValue({
-      projects: [project, secondProject],
-      activeProjectId: project.id,
-    });
-    desktop.activateProject.mockResolvedValue({ ...secondProject, branch: "feat/parser-v2" });
-    render(<App />);
-
     fireEvent.click(await screen.findByRole("button", { name: /Compiler Lab/ }));
-
-    await waitFor(() => expect(desktop.activateProject).toHaveBeenCalledWith(8));
-    expect(await screen.findByRole("button", { name: /Continue Compiler Lab/ })).toBeTruthy();
-    expect(document.querySelector(".git-line")?.textContent).toContain("feat/parser-v2");
-  });
-
-  it("preserves the current selection when atomic native activation fails", async () => {
-    desktop.loadLibrary.mockResolvedValue({
-      projects: [project, secondProject],
-      activeProjectId: project.id,
-    });
-    desktop.activateProject.mockRejectedValue("That project folder does not exist.");
-    render(<App />);
-
-    fireEvent.click(await screen.findByRole("button", { name: /Compiler Lab/ }));
-
     expect((await screen.findByRole("status")).textContent).toContain("does not exist");
     expect(screen.getByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
   });
 
-  it("keeps unsaved focus visible when native validation rejects it", async () => {
-    desktop.saveProjectFocus.mockRejectedValue("Keep the current quest between 1 and 120 characters.");
+  it("refreshes metadata manually and marks missing folders unavailable", async () => {
+    desktop.refreshProject.mockRejectedValue("That project folder does not exist.");
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /Edit focus/ }));
-    fireEvent.change(screen.getByLabelText("Current quest"), { target: { value: "" } });
+    fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
+    expect((await screen.findByRole("alert")).textContent).toContain("cannot find");
+    expect(screen.getByRole("button", { name: "Relink folder" })).toBeTruthy();
+  });
+
+  it("relinks a missing project without exposing its old path", async () => {
+    const missing = { ...project, available: false };
+    const relinked = { ...project, name: "Rate Limiter Restored", available: true };
+    desktop.bootstrapLibrary.mockResolvedValue({ ...bootstrap, projects: [missing] });
+    desktop.chooseProjectFolder.mockResolvedValue("D:\\Repos\\rate-limiter");
+    desktop.relinkProject.mockResolvedValue(relinked);
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Relink folder" }));
+    await waitFor(() => expect(desktop.relinkProject).toHaveBeenCalledWith(7, "D:\\Repos\\rate-limiter"));
+    expect(await screen.findByRole("button", { name: /Continue Rate Limiter Restored/ })).toBeTruthy();
+  });
+
+  it("removes a project while explicitly preserving its filesystem", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    await waitFor(() => expect(desktop.removeProject).toHaveBeenCalledWith(7));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("will not be deleted"));
+    expect(await screen.findByRole("button", { name: "Choose a project folder" })).toBeTruthy();
+  });
+
+  it("pins focus drafts to the project that opened the modal and restores focus", async () => {
+    const updated = { ...project, quest: "Ship safely", checkpoint: "Run the recovery test." };
+    desktop.saveProjectFocus.mockResolvedValue(updated);
+    render(<App />);
+    const edit = await screen.findByRole("button", { name: /Edit focus/ });
+    fireEvent.click(edit);
+    fireEvent.change(screen.getByLabelText("Current quest"), { target: { value: updated.quest } });
+    fireEvent.change(screen.getByLabelText("Checkpoint"), { target: { value: updated.checkpoint } });
     fireEvent.click(screen.getByRole("button", { name: /Save focus/ }));
-
-    expect((await screen.findByRole("status")).textContent).toContain("between 1 and 120");
-    expect(screen.getByRole("dialog")).toBeTruthy();
-    expect(screen.getByLabelText("Checkpoint")).toHaveProperty("value", project.checkpoint);
+    await waitFor(() => expect(desktop.saveProjectFocus).toHaveBeenCalledWith(7, updated.quest, updated.checkpoint));
+    await waitFor(() => expect(document.activeElement).toBe(edit));
   });
 
-  it("does not duplicate a project when the native upsert returns an existing id", async () => {
-    desktop.chooseProjectFolder.mockResolvedValue(project.path);
-    desktop.addProject.mockResolvedValue({ ...project, branch: "feat/refill" });
+  it("keeps failed legacy records and restores the legacy active id", async () => {
+    localStorage.setItem(LEGACY_PROJECTS_KEY, JSON.stringify([
+      { id: "ready", path: "C:\\ready", quest: "Ready" },
+      { id: "offline", path: "D:\\offline", checkpoint: "Drive missing" },
+    ]));
+    localStorage.setItem(LEGACY_ACTIVE_KEY, "offline");
+    desktop.bootstrapLibrary.mockResolvedValue({
+      ...bootstrap,
+      pendingLegacyIds: ["offline"],
+      legacyMigrationComplete: false,
+    });
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Add project/ }));
-
-    await waitFor(() => expect(desktop.addProject).toHaveBeenCalledWith(project.path));
-    expect(document.querySelectorAll(".project-cover:not(.add-cover)")).toHaveLength(1);
-    expect(document.querySelector(".git-line")?.textContent).toContain("feat/refill");
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    expect(desktop.bootstrapLibrary).toHaveBeenCalledWith([
+      { legacyId: "ready", path: "C:\\ready", quest: "Ready", checkpoint: undefined },
+      { legacyId: "offline", path: "D:\\offline", quest: undefined, checkpoint: "Drive missing" },
+    ], "offline");
+    expect(JSON.parse(localStorage.getItem(LEGACY_PROJECTS_KEY) ?? "[]")).toEqual([
+      { id: "offline", path: "D:\\offline", checkpoint: "Drive missing" },
+    ]);
+    expect(localStorage.getItem(LEGACY_ACTIVE_KEY)).toBe("offline");
   });
 
-  it("treats closing the folder picker as cancellation", async () => {
+  it("leaves malformed prototype data untouched for manual recovery", async () => {
+    localStorage.setItem(LEGACY_PROJECTS_KEY, "{not-json");
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: /^Add project/ }));
+    expect((await screen.findByRole("alert")).textContent).toContain("left it untouched");
+    expect(localStorage.getItem(LEGACY_PROJECTS_KEY)).toBe("{not-json");
+    expect(desktop.bootstrapLibrary).not.toHaveBeenCalled();
+  });
 
-    await waitFor(() => expect(desktop.chooseProjectFolder).toHaveBeenCalledOnce());
-    expect(desktop.addProject).not.toHaveBeenCalled();
-    expect(screen.queryByRole("status")).toBeNull();
+  it("leaves an entire partially malformed prototype array untouched", async () => {
+    const legacy = JSON.stringify([
+      { id: "ready", path: "C:\\ready", quest: "Ready" },
+      { id: "missing-path", checkpoint: "Do not discard me" },
+    ]);
+    localStorage.setItem(LEGACY_PROJECTS_KEY, legacy);
+    render(<App />);
+    expect((await screen.findByRole("alert")).textContent).toContain("left it untouched");
+    expect(localStorage.getItem(LEGACY_PROJECTS_KEY)).toBe(legacy);
+    expect(desktop.bootstrapLibrary).not.toHaveBeenCalled();
+  });
+
+  it("creates a SQLite online backup without receiving a filesystem path", async () => {
+    render(<App />);
+    fireEvent.click(await screen.findByRole("button", { name: "Back up" }));
+    expect((await screen.findByRole("status")).textContent).toContain("launchpad-backup-123.sqlite3");
+    expect(desktop.backupLibrary).toHaveBeenCalledWith();
+  });
+
+  it("renders Unicode initials by code point", async () => {
+    desktop.bootstrapLibrary.mockResolvedValue({
+      ...bootstrap,
+      projects: [{ ...project, name: "🌸 Garden" }],
+    });
+    render(<App />);
+    await screen.findByRole("button", { name: /Continue 🌸 Garden/ });
+    expect(document.querySelector(".focus-symbol")?.textContent).toBe("🌸G");
+  });
+
+  it("keeps browser preview read-only with an honest empty state", async () => {
+    desktop.isDesktopRuntime.mockReturnValue(false);
+    desktop.bootstrapLibrary.mockResolvedValue({
+      projects: [], activeProjectId: null, pendingLegacyIds: [], legacyMigrationComplete: true,
+    });
+    render(<App />);
+    expect(await screen.findByRole("button", { name: "Choose a project folder" })).toBeTruthy();
+    expect(desktop.bootstrapLibrary).toHaveBeenCalledWith([], null);
   });
 });
+
+const LEGACY_PROJECTS_KEY = "launchpad.projects.v1";
+const LEGACY_ACTIVE_KEY = "launchpad.active-project.v1";

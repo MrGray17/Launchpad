@@ -1,113 +1,35 @@
 mod database;
+mod inspection;
 
 use database::{
-    load_library as load_library_from_database, mark_opened, project_path, update_focus,
-    upsert_project, Database, LegacyProject, LibraryState, Project,
+    backup_database, finish_legacy_migration, legacy_migration_complete,
+    load_library as load_library_from_database, project_path, relink_project as relink_in_database,
+    remove_project as remove_from_database, update_focus, update_metadata, upsert_project,
+    validate_legacy_project, Database, LegacyProject, LibraryState, Project,
 };
+use inspection::{canonical_project_path, inspect_project_path};
 use serde::Serialize;
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tauri::{Manager, State};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct ProjectSnapshot {
-    name: String,
-    path: String,
-    branch: String,
-    git_status: String,
-    scripts: Vec<String>,
+struct BootstrapState {
+    projects: Vec<Project>,
+    active_project_id: Option<i64>,
+    pending_legacy_ids: Vec<String>,
+    legacy_migration_complete: bool,
 }
 
-fn read_branch(project_path: &Path) -> String {
-    if !project_path.join(".git").exists() {
-        return "not-a-git-repo".into();
-    }
-    match Command::new("git")
-        .arg("-C")
-        .arg(project_path)
-        .args(["symbolic-ref", "--short", "HEAD"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if branch.is_empty() {
-                "detached".into()
-            } else {
-                branch
-            }
-        }
-        _ => "detached".into(),
-    }
-}
-
-fn read_scripts(project_path: &Path) -> Vec<String> {
-    let package_path = project_path.join("package.json");
-    let Ok(package_json) = fs::read_to_string(package_path) else {
-        return vec![];
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&package_json) else {
-        return vec![];
-    };
-    value
-        .get("scripts")
-        .and_then(|scripts| scripts.as_object())
-        .map(|scripts| {
-            let mut names = scripts.keys().cloned().collect::<Vec<_>>();
-            names.sort();
-            names
-        })
-        .unwrap_or_default()
-}
-
-fn read_git_status(project_path: &Path) -> String {
-    if !project_path.join(".git").exists() {
-        return "unknown".into();
-    }
-    match Command::new("git")
-        .arg("-C")
-        .arg(project_path)
-        .args(["status", "--porcelain"])
-        .output()
-    {
-        Ok(output) if output.status.success() => {
-            if output.stdout.is_empty() {
-                "clean".into()
-            } else {
-                "dirty".into()
-            }
-        }
-        _ => "unknown".into(),
-    }
-}
-
-fn canonical_project_path(path: String) -> Result<PathBuf, String> {
-    let project_path = PathBuf::from(path);
-    if !project_path.is_dir() {
-        return Err("That project folder does not exist.".into());
-    }
-    project_path
-        .canonicalize()
-        .map_err(|_| "Could not resolve that project folder.".to_string())
-}
-
-fn inspect_project_path(path: String) -> Result<ProjectSnapshot, String> {
-    let canonical = canonical_project_path(path)?;
-    let name = canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("Project")
-        .to_string();
-    Ok(ProjectSnapshot {
-        name,
-        path: canonical.to_string_lossy().to_string(),
-        branch: read_branch(&canonical),
-        git_status: read_git_status(&canonical),
-        scripts: read_scripts(&canonical),
-    })
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupResult {
+    file_name: String,
 }
 
 async fn run_blocking<T, F>(operation: F) -> Result<T, String>
@@ -131,69 +53,117 @@ where
     run_blocking(move || database.with_connection(operation)).await
 }
 
-#[tauri::command]
-async fn inspect_project(path: String) -> Result<ProjectSnapshot, String> {
-    run_blocking(move || inspect_project_path(path)).await
+fn refresh_project_record(
+    database: &Database,
+    id: i64,
+    make_active: bool,
+    mark_as_opened: bool,
+) -> Result<Project, String> {
+    let path = database.with_connection(|connection| project_path(connection, id))?;
+    let snapshot = inspect_project_path(path)?;
+    database.with_connection(|connection| {
+        update_metadata(connection, id, &snapshot, make_active, mark_as_opened)
+    })
+}
+
+fn bootstrap_library(
+    database: &Database,
+    projects: Vec<LegacyProject>,
+    active_legacy_id: Option<String>,
+) -> Result<BootstrapState, String> {
+    let already_complete =
+        database.with_connection(|connection| legacy_migration_complete(connection))?;
+    let mut pending_legacy_ids = Vec::new();
+
+    if !already_complete {
+        for project in projects {
+            let result = validate_legacy_project(&project)
+                .and_then(|_| inspect_project_path(project.path.clone()))
+                .and_then(|snapshot| {
+                    let make_active = active_legacy_id.as_deref() == Some(&project.legacy_id);
+                    database.with_connection(|connection| {
+                        upsert_project(connection, &snapshot, Some(&project), make_active)
+                    })
+                });
+            if let Err(error) = result {
+                eprintln!(
+                    "Legacy Launchpad project '{}' remains pending: {error}",
+                    project.legacy_id
+                );
+                pending_legacy_ids.push(project.legacy_id);
+            }
+        }
+        if pending_legacy_ids.is_empty() {
+            database.with_connection(|connection| finish_legacy_migration(connection))?;
+        }
+    }
+
+    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    if let Some(active_id) = library.active_project_id {
+        let _ = refresh_project_record(database, active_id, true, false);
+    }
+    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    let migration_complete =
+        database.with_connection(|connection| legacy_migration_complete(connection))?;
+    Ok(BootstrapState {
+        projects: library.projects,
+        active_project_id: library.active_project_id,
+        pending_legacy_ids,
+        legacy_migration_complete: migration_complete,
+    })
 }
 
 #[tauri::command]
-async fn load_library(database: State<'_, Database>) -> Result<LibraryState, String> {
+async fn bootstrap(
+    projects: Vec<LegacyProject>,
+    active_legacy_id: Option<String>,
+    database: State<'_, Database>,
+) -> Result<BootstrapState, String> {
     let database = database.inner().clone();
-    run_database(database, |connection| {
-        load_library_from_database(connection)
-    })
-    .await
+    run_blocking(move || bootstrap_library(&database, projects, active_legacy_id)).await
 }
 
 #[tauri::command]
 async fn add_project(path: String, database: State<'_, Database>) -> Result<Project, String> {
+    let snapshot = run_blocking(move || inspect_project_path(path)).await?;
     let database = database.inner().clone();
     run_database(database, move |connection| {
-        let snapshot = inspect_project_path(path)?;
         upsert_project(connection, &snapshot, None, true)
     })
     .await
 }
 
 #[tauri::command]
-async fn import_legacy_projects(
-    projects: Vec<LegacyProject>,
+async fn activate_project(id: i64, database: State<'_, Database>) -> Result<Project, String> {
+    let database = database.inner().clone();
+    run_blocking(move || refresh_project_record(&database, id, true, false)).await
+}
+
+#[tauri::command]
+async fn refresh_project(id: i64, database: State<'_, Database>) -> Result<Project, String> {
+    let database = database.inner().clone();
+    run_blocking(move || refresh_project_record(&database, id, false, false)).await
+}
+
+#[tauri::command]
+async fn relink_project(
+    id: i64,
+    path: String,
     database: State<'_, Database>,
-) -> Result<LibraryState, String> {
+) -> Result<Project, String> {
+    let snapshot = run_blocking(move || inspect_project_path(path)).await?;
     let database = database.inner().clone();
     run_database(database, move |connection| {
-        for project in projects {
-            match inspect_project_path(project.path.clone()) {
-                Ok(snapshot) => {
-                    upsert_project(connection, &snapshot, Some(&project), false)?;
-                }
-                Err(error) => {
-                    eprintln!(
-                        "Skipping legacy Launchpad project '{}': {error}",
-                        project.path
-                    );
-                }
-            }
-        }
-        load_library_from_database(connection)
+        relink_in_database(connection, id, &snapshot)
     })
     .await
 }
 
-fn activate_project_record(
-    connection: &mut rusqlite::Connection,
-    id: i64,
-) -> Result<Project, String> {
-    let path = project_path(connection, id)?;
-    let snapshot = inspect_project_path(path)?;
-    upsert_project(connection, &snapshot, None, true)
-}
-
 #[tauri::command]
-async fn activate_project(id: i64, database: State<'_, Database>) -> Result<Project, String> {
+async fn remove_project(id: i64, database: State<'_, Database>) -> Result<LibraryState, String> {
     let database = database.inner().clone();
     run_database(database, move |connection| {
-        activate_project_record(connection, id)
+        remove_from_database(connection, id)
     })
     .await
 }
@@ -212,57 +182,128 @@ async fn save_project_focus(
     .await
 }
 
-#[tauri::command]
-async fn open_in_vscode(id: i64, database: State<'_, Database>) -> Result<Project, String> {
-    let database = database.inner().clone();
-    run_database(database, move |connection| {
-        let path = project_path(connection, id)?;
-        let project_path = canonical_project_path(path)?;
-        Command::new("code")
-            .arg(project_path)
-            .spawn()
-            .map_err(|_| {
-                "VS Code could not be opened. Make sure the `code` command is on PATH.".to_string()
-            })?;
-        mark_opened(connection, id)
-    })
-    .await
+fn spawn_first_available(mut candidates: Vec<Command>, failure: &str) -> Result<(), String> {
+    for command in &mut candidates {
+        match command.spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                eprintln!("Launchpad launcher failed: {error}");
+                return Err(failure.to_string());
+            }
+        }
+    }
+    Err(failure.to_string())
+}
+
+fn editor_candidates(project_path: &Path) -> Vec<Command> {
+    let mut candidates = Vec::new();
+    for executable in ["code.cmd", "code"] {
+        let mut command = Command::new(executable);
+        command.arg(project_path);
+        candidates.push(command);
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let mut command = Command::new(
+            PathBuf::from(local_app_data)
+                .join("Programs")
+                .join("Microsoft VS Code")
+                .join("Code.exe"),
+        );
+        command.arg(project_path);
+        candidates.push(command);
+    }
+    candidates
+}
+
+fn terminal_candidates(project_path: &Path) -> Vec<Command> {
+    let mut candidates = Vec::new();
+    #[cfg(target_os = "windows")]
+    {
+        let mut terminal = Command::new("wt.exe");
+        terminal.arg("-d").arg(project_path);
+        candidates.push(terminal);
+        for executable in ["powershell.exe", "cmd.exe"] {
+            let mut command = Command::new(executable);
+            command.current_dir(project_path);
+            if executable == "powershell.exe" {
+                command.arg("-NoExit");
+            } else {
+                command.arg("/K");
+            }
+            candidates.push(command);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut terminal = Command::new("open");
+        terminal.args(["-a", "Terminal"]).arg(project_path);
+        candidates.push(terminal);
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    for executable in ["x-terminal-emulator", "gnome-terminal", "konsole", "xterm"] {
+        let mut command = Command::new(executable);
+        command.current_dir(project_path);
+        candidates.push(command);
+    }
+    candidates
+}
+
+fn open_project(database: &Database, id: i64, terminal: bool) -> Result<Project, String> {
+    let path = database.with_connection(|connection| project_path(connection, id))?;
+    let snapshot = inspect_project_path(path.clone())?;
+    let canonical = canonical_project_path(path)?;
+    if terminal {
+        spawn_first_available(
+            terminal_candidates(&canonical),
+            "No supported terminal could be opened. Install Windows Terminal, PowerShell, or another supported terminal.",
+        )?;
+    } else {
+        spawn_first_available(
+            editor_candidates(&canonical),
+            "VS Code could not be opened. Install VS Code or enable its `code` command.",
+        )?;
+    }
+    database.with_connection(|connection| update_metadata(connection, id, &snapshot, false, true))
 }
 
 #[tauri::command]
-async fn open_terminal(id: i64, database: State<'_, Database>) -> Result<(), String> {
+async fn open_in_vscode(id: i64, database: State<'_, Database>) -> Result<Project, String> {
     let database = database.inner().clone();
-    run_database(database, move |connection| {
-        let path = project_path(connection, id)?;
-        let project_path = canonical_project_path(path)?;
-        #[cfg(target_os = "windows")]
-        {
-            Command::new("wt.exe")
-                .arg("-d")
-                .arg(project_path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|_| "Windows Terminal could not be opened.".to_string())
-        }
-        #[cfg(target_os = "macos")]
-        {
-            Command::new("open")
-                .args(["-a", "Terminal"])
-                .arg(project_path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|_| "Terminal could not be opened.".to_string())
-        }
-        #[cfg(all(unix, not(target_os = "macos")))]
-        {
-            Command::new("x-terminal-emulator")
-                .current_dir(project_path)
-                .spawn()
-                .map(|_| ())
-                .map_err(|_| "Terminal could not be opened.".to_string())
-        }
+    run_blocking(move || open_project(&database, id, false)).await
+}
+
+#[tauri::command]
+async fn open_terminal(id: i64, database: State<'_, Database>) -> Result<Project, String> {
+    let database = database.inner().clone();
+    run_blocking(move || open_project(&database, id, true)).await
+}
+
+#[tauri::command]
+async fn backup_library(
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<BackupResult, String> {
+    let backup_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|_| "Launchpad could not locate its app-data folder.".to_string())?
+        .join("backups");
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Launchpad could not timestamp the backup.".to_string())?
+        .as_nanos();
+    let file_name = format!("launchpad-backup-{timestamp}.sqlite3");
+    let path = backup_dir.join(&file_name);
+    let database = database.inner().clone();
+    run_blocking(move || {
+        fs::create_dir_all(&backup_dir)
+            .map_err(|_| "Launchpad could not create its backup folder.".to_string())?;
+        database.with_connection(|connection| backup_database(connection, &path))
     })
-    .await
+    .await?;
+    Ok(BackupResult { file_name })
 }
 
 fn initialize_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
@@ -275,6 +316,13 @@ fn initialize_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let database = initialize_database(app.handle())?;
@@ -282,14 +330,16 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            inspect_project,
-            load_library,
+            bootstrap,
             add_project,
-            import_legacy_projects,
             activate_project,
+            refresh_project,
+            relink_project,
+            remove_project,
             save_project_focus,
             open_in_vscode,
-            open_terminal
+            open_terminal,
+            backup_library
         ])
         .run(tauri::generate_context!())
         .expect("error while running Launchpad");
@@ -300,82 +350,36 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    struct TestProject(PathBuf);
-    impl TestProject {
+    struct TestDirectory(PathBuf);
+    impl TestDirectory {
         fn new(name: &str) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
+                .unwrap()
                 .as_nanos();
-            let path = std::env::temp_dir()
-                .join(format!("launchpad-{name}-{}-{nonce}", std::process::id()));
-            fs::create_dir_all(&path).expect("test project directory should be created");
+            let path = std::env::temp_dir().join(format!(
+                "launchpad-orchestration-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&path).unwrap();
             Self(path)
         }
     }
-    impl Drop for TestProject {
+    impl Drop for TestDirectory {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
     }
 
     #[test]
-    fn inspect_project_reads_git_and_package_metadata() {
-        let project = TestProject::new("metadata");
-        let status = Command::new("git")
-            .args(["init", "--quiet"])
-            .arg(&project.0)
-            .status()
-            .expect("git should be available for project inspection");
-        assert!(status.success());
-        fs::write(
-            project.0.join("package.json"),
-            r#"{"scripts":{"test":"vitest","build":"vite build","dev":"vite"}}"#,
-        )
-        .expect("package.json should be written");
-        let snapshot = inspect_project_path(project.0.to_string_lossy().to_string())
-            .expect("project inspection should succeed");
-        assert_eq!(
-            snapshot.name,
-            project.0.file_name().unwrap().to_string_lossy()
-        );
-        assert_eq!(
-            snapshot.path,
-            project.0.canonicalize().unwrap().to_string_lossy()
-        );
-        assert_ne!(snapshot.branch, "not-a-git-repo");
-        assert_eq!(snapshot.git_status, "dirty");
-        assert_eq!(snapshot.scripts, ["build", "dev", "test"]);
-    }
-
-    #[test]
-    fn inspect_project_handles_a_non_git_folder_without_package_json() {
-        let project = TestProject::new("plain-folder");
-        let snapshot = inspect_project_path(project.0.to_string_lossy().to_string())
-            .expect("plain folders should still be inspectable");
-        assert_eq!(snapshot.branch, "not-a-git-repo");
-        assert_eq!(snapshot.git_status, "unknown");
-        assert!(snapshot.scripts.is_empty());
-    }
-
-    #[test]
-    fn inspect_project_rejects_a_missing_folder() {
-        let missing = std::env::temp_dir().join("launchpad-folder-that-does-not-exist");
-        let error = inspect_project_path(missing.to_string_lossy().to_string())
-            .expect_err("missing folders should be rejected");
-        assert_eq!(error, "That project folder does not exist.");
-    }
-
-    #[test]
     fn failed_activation_does_not_change_the_persisted_active_project() {
-        let first = TestProject::new("active-first");
-        let missing = TestProject::new("active-missing");
-        let storage = TestProject::new("active-database");
+        let first = TestDirectory::new("active-first");
+        let missing = TestDirectory::new("active-missing");
+        let storage = TestDirectory::new("active-database");
+        let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
         let first_snapshot = inspect_project_path(first.0.to_string_lossy().to_string()).unwrap();
         let missing_snapshot =
             inspect_project_path(missing.0.to_string_lossy().to_string()).unwrap();
-        let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
-
         let (first_id, missing_id) = database
             .with_connection(|connection| {
                 let first_project = upsert_project(connection, &first_snapshot, None, true)?;
@@ -383,67 +387,39 @@ mod tests {
                 Ok((first_project.id, missing_project.id))
             })
             .unwrap();
-        fs::remove_dir_all(&missing.0).expect("project folder should be removed for the test");
+        fs::remove_dir_all(&missing.0).unwrap();
 
-        database
-            .with_connection(|connection| {
-                assert!(activate_project_record(connection, missing_id).is_err());
-                let library = load_library_from_database(connection)?;
-                assert_eq!(library.active_project_id, Some(first_id));
-                Ok(())
-            })
+        assert!(refresh_project_record(&database, missing_id, true, false).is_err());
+        let library = database
+            .with_connection(|connection| load_library_from_database(connection))
             .unwrap();
+        assert_eq!(library.active_project_id, Some(first_id));
     }
 
     #[test]
-    fn inspect_project_reads_the_branch_from_a_linked_git_worktree() {
-        let repository = TestProject::new("worktree-source");
-        let linked = TestProject::new("worktree-linked");
-        fs::remove_dir(&linked.0).expect("linked worktree target should start absent");
-
-        assert!(Command::new("git")
-            .args(["init", "--quiet"])
-            .arg(&repository.0)
-            .status()
-            .unwrap()
-            .success());
-        fs::write(repository.0.join("README.md"), "worktree fixture")
-            .expect("fixture should be written");
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(&repository.0)
-            .args(["add", "README.md"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(&repository.0)
-            .args([
-                "-c",
-                "user.name=Launchpad Test",
-                "-c",
-                "user.email=launchpad@example.invalid",
-                "commit",
-                "--quiet",
-                "-m",
-                "fixture",
-            ])
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .arg("-C")
-            .arg(&repository.0)
-            .args(["worktree", "add", "--quiet", "-b", "feat/linked"])
-            .arg(&linked.0)
-            .status()
-            .unwrap()
-            .success());
-
-        let snapshot = inspect_project_path(linked.0.to_string_lossy().to_string())
-            .expect("linked worktrees should be inspectable");
-        assert_eq!(snapshot.branch, "feat/linked");
-        assert!(linked.0.join(".git").is_file());
+    fn partial_legacy_migration_keeps_missing_records_pending_and_restores_active() {
+        let available = TestDirectory::new("legacy-available");
+        let storage = TestDirectory::new("legacy-database");
+        let database = Database::open(&storage.0.join("library.sqlite3")).unwrap();
+        let projects = vec![
+            LegacyProject {
+                legacy_id: "available".to_string(),
+                path: available.0.to_string_lossy().to_string(),
+                quest: "Keep this quest".to_string(),
+                checkpoint: "Keep this note".to_string(),
+            },
+            LegacyProject {
+                legacy_id: "missing".to_string(),
+                path: storage.0.join("missing").to_string_lossy().to_string(),
+                quest: "Do not lose me".to_string(),
+                checkpoint: "Drive is disconnected".to_string(),
+            },
+        ];
+        let state = bootstrap_library(&database, projects, Some("available".to_string())).unwrap();
+        assert_eq!(state.pending_legacy_ids, ["missing"]);
+        assert!(!state.legacy_migration_complete);
+        assert_eq!(state.projects.len(), 1);
+        assert_eq!(state.active_project_id, Some(state.projects[0].id));
+        assert_eq!(state.projects[0].quest, "Keep this quest");
     }
 }

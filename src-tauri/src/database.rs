@@ -1,17 +1,17 @@
-use crate::ProjectSnapshot;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use crate::inspection::ProjectSnapshot;
+use rusqlite::{ffi::ErrorCode, params, Connection, OptionalExtension, Row, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use std::{
     path::Path,
     sync::{Arc, Mutex},
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const DEFAULT_QUEST: &str = "Choose the next concrete step";
 const DEFAULT_CHECKPOINT: &str = "Start by deciding what done looks like.";
 const PROJECT_COLUMNS: &str = "
-    id, name, path, branch, git_status, scripts_json, quest, checkpoint,
-    created_at, updated_at, last_opened_at
+    id, name, path, branch, git_status, metadata_status, scripts_json, quest, checkpoint,
+    created_at, updated_at, last_opened_at, metadata_refreshed_at
 ";
 
 #[derive(Clone)]
@@ -22,20 +22,25 @@ pub(crate) struct Database(Arc<Mutex<Connection>>);
 pub(crate) struct Project {
     pub(crate) id: i64,
     pub(crate) name: String,
+    #[serde(skip_serializing)]
     pub(crate) path: String,
     pub(crate) branch: String,
     pub(crate) git_status: String,
+    pub(crate) metadata_status: String,
     pub(crate) scripts: Vec<String>,
     pub(crate) quest: String,
     pub(crate) checkpoint: String,
     pub(crate) created_at: String,
     pub(crate) updated_at: String,
     pub(crate) last_opened_at: Option<String>,
+    pub(crate) metadata_refreshed_at: Option<String>,
+    pub(crate) available: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LegacyProject {
+    pub(crate) legacy_id: String,
     pub(crate) path: String,
     #[serde(default)]
     pub(crate) quest: String,
@@ -43,7 +48,7 @@ pub(crate) struct LegacyProject {
     pub(crate) checkpoint: String,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LibraryState {
     pub(crate) projects: Vec<Project>,
@@ -78,7 +83,28 @@ impl Database {
 
 fn database_error(error: rusqlite::Error) -> String {
     eprintln!("Launchpad database error: {error}");
-    "Launchpad could not access its local library.".to_string()
+    match error {
+        rusqlite::Error::SqliteFailure(details, _) => match details.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => {
+                "Launchpad's library is busy. Close any other Launchpad window and try again."
+            }
+            ErrorCode::PermissionDenied | ErrorCode::ReadOnly | ErrorCode::CannotOpen => {
+                "Launchpad cannot write to its app-data folder. Check its permissions and free space."
+            }
+            ErrorCode::DiskFull => {
+                "The device is out of space. Free some storage before Launchpad saves again."
+            }
+            ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => {
+                "Launchpad's library appears damaged. Restore a recent Launchpad backup."
+            }
+            ErrorCode::SystemIoFailure => {
+                "Launchpad encountered a disk I/O error while accessing its library."
+            }
+            _ => "Launchpad could not access its local library.",
+        },
+        _ => "Launchpad could not access its local library.",
+    }
+    .to_string()
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), String> {
@@ -91,7 +117,7 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
         )
         .map_err(database_error)?;
 
-    let version = connection
+    let mut version = connection
         .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
         .map_err(database_error)?;
     if version > SCHEMA_VERSION {
@@ -123,7 +149,23 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
             )
             .map_err(database_error)?;
         transaction
-            .pragma_update(None, "user_version", SCHEMA_VERSION)
+            .pragma_update(None, "user_version", 1)
+            .map_err(database_error)?;
+        transaction.commit().map_err(database_error)?;
+        version = 1;
+    }
+
+    if version < 2 {
+        let transaction = connection.transaction().map_err(database_error)?;
+        transaction
+            .execute_batch(
+                "ALTER TABLE projects ADD COLUMN metadata_status TEXT NOT NULL DEFAULT 'unknown';
+                 ALTER TABLE projects ADD COLUMN metadata_refreshed_at TEXT;
+                 ALTER TABLE preferences ADD COLUMN legacy_migration_complete INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(database_error)?;
+        transaction
+            .pragma_update(None, "user_version", 2)
             .map_err(database_error)?;
         transaction.commit().map_err(database_error)?;
     }
@@ -131,19 +173,23 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
 }
 
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
-    let scripts_json = row.get::<_, String>(5)?;
+    let path = row.get::<_, String>(2)?;
+    let scripts_json = row.get::<_, String>(6)?;
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
-        path: row.get(2)?,
+        available: Path::new(&path).is_dir(),
+        path,
         branch: row.get(3)?,
         git_status: row.get(4)?,
+        metadata_status: row.get(5)?,
         scripts: serde_json::from_str(&scripts_json).unwrap_or_default(),
-        quest: row.get(6)?,
-        checkpoint: row.get(7)?,
-        created_at: row.get(8)?,
-        updated_at: row.get(9)?,
-        last_opened_at: row.get(10)?,
+        quest: row.get(7)?,
+        checkpoint: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        last_opened_at: row.get(11)?,
+        metadata_refreshed_at: row.get(12)?,
     })
 }
 
@@ -196,6 +242,32 @@ pub(crate) fn project_path(connection: &Connection, id: i64) -> Result<String, S
         .ok_or_else(|| "That project is no longer in your collection.".to_string())
 }
 
+fn validate_focus(quest: &str, checkpoint: &str) -> Result<(String, String), String> {
+    let quest = quest.trim();
+    let checkpoint = checkpoint.trim();
+    if quest.is_empty() || quest.chars().count() > 120 {
+        return Err("Keep the current quest between 1 and 120 characters.".to_string());
+    }
+    if checkpoint.is_empty() || checkpoint.chars().count() > 180 {
+        return Err("Keep the checkpoint between 1 and 180 characters.".to_string());
+    }
+    Ok((quest.to_string(), checkpoint.to_string()))
+}
+
+pub(crate) fn validate_legacy_project(project: &LegacyProject) -> Result<(), String> {
+    let quest = if project.quest.trim().is_empty() {
+        DEFAULT_QUEST
+    } else {
+        &project.quest
+    };
+    let checkpoint = if project.checkpoint.trim().is_empty() {
+        DEFAULT_CHECKPOINT
+    } else {
+        &project.checkpoint
+    };
+    validate_focus(quest, checkpoint).map(|_| ())
+}
+
 pub(crate) fn upsert_project(
     connection: &mut Connection,
     snapshot: &ProjectSnapshot,
@@ -204,25 +276,45 @@ pub(crate) fn upsert_project(
 ) -> Result<Project, String> {
     let scripts_json = serde_json::to_string(&snapshot.scripts)
         .map_err(|_| "Launchpad could not store the detected scripts.".to_string())?;
+    let (quest, checkpoint) = if let Some(project) = legacy {
+        let quest = if project.quest.trim().is_empty() {
+            DEFAULT_QUEST
+        } else {
+            &project.quest
+        };
+        let checkpoint = if project.checkpoint.trim().is_empty() {
+            DEFAULT_CHECKPOINT
+        } else {
+            &project.checkpoint
+        };
+        validate_focus(quest, checkpoint)?
+    } else {
+        (DEFAULT_QUEST.to_string(), DEFAULT_CHECKPOINT.to_string())
+    };
     let transaction = connection.transaction().map_err(database_error)?;
     transaction
         .execute(
-            "INSERT INTO projects (name, path, branch, git_status, scripts_json, quest, checkpoint)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "INSERT INTO projects (
+                name, path, branch, git_status, metadata_status, scripts_json, quest, checkpoint,
+                metadata_refreshed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
              ON CONFLICT(path) DO UPDATE SET
                 name = excluded.name,
                 branch = excluded.branch,
                 git_status = excluded.git_status,
+                metadata_status = excluded.metadata_status,
                 scripts_json = excluded.scripts_json,
+                metadata_refreshed_at = excluded.metadata_refreshed_at,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')",
             params![
                 snapshot.name,
                 snapshot.path,
                 snapshot.branch,
                 snapshot.git_status,
+                snapshot.metadata_status,
                 scripts_json,
-                DEFAULT_QUEST,
-                DEFAULT_CHECKPOINT,
+                quest,
+                checkpoint,
             ],
         )
         .map_err(database_error)?;
@@ -234,21 +326,14 @@ pub(crate) fn upsert_project(
         )
         .map_err(database_error)?;
 
-    if let Some(legacy) = legacy {
-        let quest = legacy.quest.trim();
-        let checkpoint = legacy.checkpoint.trim();
-        if !quest.is_empty() || !checkpoint.is_empty() {
-            transaction
-                .execute(
-                    "UPDATE projects SET
-                        quest = CASE WHEN ?2 = '' THEN quest ELSE ?2 END,
-                        checkpoint = CASE WHEN ?3 = '' THEN checkpoint ELSE ?3 END,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                     WHERE id = ?1",
-                    params![id, quest, checkpoint],
-                )
-                .map_err(database_error)?;
-        }
+    if legacy.is_some() {
+        transaction
+            .execute(
+                "UPDATE projects SET quest = ?2, checkpoint = ?3,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+                params![id, quest, checkpoint],
+            )
+            .map_err(database_error)?;
     }
     if make_active {
         transaction
@@ -262,20 +347,129 @@ pub(crate) fn upsert_project(
     project_by_id(connection, id)
 }
 
+pub(crate) fn update_metadata(
+    connection: &mut Connection,
+    id: i64,
+    snapshot: &ProjectSnapshot,
+    make_active: bool,
+    mark_as_opened: bool,
+) -> Result<Project, String> {
+    let scripts_json = serde_json::to_string(&snapshot.scripts)
+        .map_err(|_| "Launchpad could not store the detected scripts.".to_string())?;
+    let transaction = connection.transaction().map_err(database_error)?;
+    let changed = transaction
+        .execute(
+            "UPDATE projects SET name = ?2, branch = ?3, git_status = ?4,
+                metadata_status = ?5, scripts_json = ?6,
+                metadata_refreshed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                last_opened_at = CASE WHEN ?7 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now') ELSE last_opened_at END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?1",
+            params![
+                id,
+                snapshot.name,
+                snapshot.branch,
+                snapshot.git_status,
+                snapshot.metadata_status,
+                scripts_json,
+                mark_as_opened,
+            ],
+        )
+        .map_err(database_error)?;
+    if changed == 0 {
+        return Err("That project is no longer in your collection.".to_string());
+    }
+    if make_active {
+        transaction
+            .execute(
+                "UPDATE preferences SET active_project_id = ?1 WHERE singleton = 1",
+                [id],
+            )
+            .map_err(database_error)?;
+    }
+    transaction.commit().map_err(database_error)?;
+    project_by_id(connection, id)
+}
+
+pub(crate) fn relink_project(
+    connection: &mut Connection,
+    id: i64,
+    snapshot: &ProjectSnapshot,
+) -> Result<Project, String> {
+    let scripts_json = serde_json::to_string(&snapshot.scripts)
+        .map_err(|_| "Launchpad could not store the detected scripts.".to_string())?;
+    let changed = connection
+        .execute(
+            "UPDATE projects SET name = ?2, path = ?3, branch = ?4, git_status = ?5,
+                metadata_status = ?6, scripts_json = ?7,
+                metadata_refreshed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
+            params![
+                id,
+                snapshot.name,
+                snapshot.path,
+                snapshot.branch,
+                snapshot.git_status,
+                snapshot.metadata_status,
+                scripts_json,
+            ],
+        )
+        .map_err(|error| match &error {
+            rusqlite::Error::SqliteFailure(details, _)
+                if details.code == ErrorCode::ConstraintViolation =>
+            {
+                "That folder already belongs to another project in Launchpad.".to_string()
+            }
+            _ => database_error(error),
+        })?;
+    if changed == 0 {
+        return Err("That project is no longer in your collection.".to_string());
+    }
+    project_by_id(connection, id)
+}
+
+pub(crate) fn remove_project(connection: &mut Connection, id: i64) -> Result<LibraryState, String> {
+    let transaction = connection.transaction().map_err(database_error)?;
+    let changed = transaction
+        .execute("DELETE FROM projects WHERE id = ?1", [id])
+        .map_err(database_error)?;
+    if changed == 0 {
+        return Err("That project is no longer in your collection.".to_string());
+    }
+    let active: Option<i64> = transaction
+        .query_row(
+            "SELECT active_project_id FROM preferences WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(database_error)?;
+    if active.is_none() {
+        let next = transaction
+            .query_row(
+                "SELECT id FROM projects ORDER BY COALESCE(last_opened_at, created_at) DESC, name COLLATE NOCASE LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(database_error)?;
+        transaction
+            .execute(
+                "UPDATE preferences SET active_project_id = ?1 WHERE singleton = 1",
+                [next],
+            )
+            .map_err(database_error)?;
+    }
+    transaction.commit().map_err(database_error)?;
+    load_library(connection)
+}
+
 pub(crate) fn update_focus(
     connection: &Connection,
     id: i64,
     quest: &str,
     checkpoint: &str,
 ) -> Result<Project, String> {
-    let quest = quest.trim();
-    let checkpoint = checkpoint.trim();
-    if quest.is_empty() || quest.chars().count() > 120 {
-        return Err("Keep the current quest between 1 and 120 characters.".to_string());
-    }
-    if checkpoint.is_empty() || checkpoint.chars().count() > 180 {
-        return Err("Keep the checkpoint between 1 and 180 characters.".to_string());
-    }
+    let (quest, checkpoint) = validate_focus(quest, checkpoint)?;
     let changed = connection
         .execute(
             "UPDATE projects SET quest = ?2, checkpoint = ?3,
@@ -289,19 +483,30 @@ pub(crate) fn update_focus(
     project_by_id(connection, id)
 }
 
-pub(crate) fn mark_opened(connection: &Connection, id: i64) -> Result<Project, String> {
-    let changed = connection
+pub(crate) fn legacy_migration_complete(connection: &Connection) -> Result<bool, String> {
+    connection
+        .query_row(
+            "SELECT legacy_migration_complete FROM preferences WHERE singleton = 1",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .map_err(database_error)
+}
+
+pub(crate) fn finish_legacy_migration(connection: &Connection) -> Result<(), String> {
+    connection
         .execute(
-            "UPDATE projects SET
-                last_opened_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE id = ?1",
-            [id],
+            "UPDATE preferences SET legacy_migration_complete = 1 WHERE singleton = 1",
+            [],
         )
         .map_err(database_error)?;
-    if changed == 0 {
-        return Err("That project is no longer in your collection.".to_string());
-    }
-    project_by_id(connection, id)
+    Ok(())
+}
+
+pub(crate) fn backup_database(connection: &Connection, path: &Path) -> Result<(), String> {
+    connection
+        .backup(MAIN_DB, path, None)
+        .map_err(database_error)
 }
 
 #[cfg(test)]
@@ -317,23 +522,21 @@ mod tests {
         directory: PathBuf,
         path: PathBuf,
     }
-
     impl TestDatabase {
         fn new(name: &str) -> Self {
             let nonce = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
-                .expect("system clock should be after the Unix epoch")
+                .unwrap()
                 .as_nanos();
             let directory = std::env::temp_dir().join(format!(
                 "launchpad-database-{name}-{}-{nonce}",
                 std::process::id()
             ));
-            fs::create_dir_all(&directory).expect("database test directory should be created");
+            fs::create_dir_all(&directory).unwrap();
             let path = directory.join("launchpad.sqlite3");
             Self { directory, path }
         }
     }
-
     impl Drop for TestDatabase {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.directory);
@@ -346,18 +549,58 @@ mod tests {
             path: path.to_string(),
             branch: "main".to_string(),
             git_status: "clean".to_string(),
+            metadata_status: "fresh".to_string(),
             scripts: vec!["build".to_string(), "test".to_string()],
         }
     }
 
     #[test]
-    fn migration_creates_an_empty_library() {
+    fn new_database_has_the_current_schema() {
         let database = Database::in_memory();
-        let library = database
-            .with_connection(|connection| load_library(connection))
+        database
+            .with_connection(|connection| {
+                assert_eq!(
+                    connection
+                        .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    SCHEMA_VERSION
+                );
+                assert!(load_library(connection)?.projects.is_empty());
+                Ok(())
+            })
             .unwrap();
-        assert!(library.projects.is_empty());
-        assert_eq!(library.active_project_id, None);
+    }
+
+    #[test]
+    fn version_one_database_migrates_without_losing_focus() {
+        let storage = TestDatabase::new("v1-migration");
+        let connection = Connection::open(&storage.path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, path TEXT NOT NULL UNIQUE,
+                branch TEXT NOT NULL, git_status TEXT NOT NULL, scripts_json TEXT NOT NULL DEFAULT '[]',
+                quest TEXT NOT NULL, checkpoint TEXT NOT NULL, created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL, last_opened_at TEXT
+             );
+             CREATE TABLE preferences (
+                singleton INTEGER PRIMARY KEY, active_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL
+             );
+             INSERT INTO projects VALUES (1, 'Legacy', 'C:\\legacy', 'main', 'clean', '[]', 'Keep quest', 'Keep note', 'now', 'now', NULL);
+             INSERT INTO preferences VALUES (1, 1);
+             PRAGMA user_version = 1;"
+        ).unwrap();
+        drop(connection);
+
+        let database = Database::open(&storage.path).unwrap();
+        database
+            .with_connection(|connection| {
+                let library = load_library(connection)?;
+                assert_eq!(library.projects[0].quest, "Keep quest");
+                assert_eq!(library.projects[0].metadata_status, "unknown");
+                assert!(!legacy_migration_complete(connection)?);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -366,117 +609,127 @@ mod tests {
         database
             .with_connection(|connection| {
                 let original = upsert_project(connection, &snapshot("C:\\repo"), None, true)?;
-                let focused = update_focus(
+                update_focus(
                     connection,
                     original.id,
-                    "Ship the token bucket",
-                    "Add the capacity regression test.",
+                    "Ship safely",
+                    "Add a regression test.",
                 )?;
-                let mut refreshed = snapshot("C:\\repo");
-                refreshed.branch = "feat/token-bucket".to_string();
-                let duplicate = upsert_project(connection, &refreshed, None, false)?;
+                let duplicate = upsert_project(connection, &snapshot("C:\\repo"), None, false)?;
                 assert_eq!(original.id, duplicate.id);
-                assert_eq!(duplicate.branch, "feat/token-bucket");
-                assert_eq!(duplicate.quest, focused.quest);
-                assert_eq!(duplicate.checkpoint, focused.checkpoint);
-                let library = load_library(connection)?;
+                assert_eq!(duplicate.quest, "Ship safely");
+                assert_eq!(load_library(connection)?.projects.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn serialized_projects_do_not_expose_absolute_paths() {
+        let database = Database::in_memory();
+        database
+            .with_connection(|connection| {
+                let project =
+                    upsert_project(connection, &snapshot("C:\\private\\repo"), None, true)?;
+                let serialized = serde_json::to_value(project)
+                    .map_err(|error| format!("Could not serialize test project: {error}"))?;
+                assert!(serialized.get("path").is_none());
+                assert_eq!(
+                    serialized.get("name").and_then(|value| value.as_str()),
+                    Some("Rate Limiter")
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_focus_is_validated_before_writing() {
+        let database = Database::in_memory();
+        database
+            .with_connection(|connection| {
+                let legacy = LegacyProject {
+                    legacy_id: "legacy".to_string(),
+                    path: "C:\\repo".to_string(),
+                    quest: "x".repeat(121),
+                    checkpoint: "valid".to_string(),
+                };
+                assert!(
+                    upsert_project(connection, &snapshot("C:\\repo"), Some(&legacy), true).is_err()
+                );
+                assert!(load_library(connection)?.projects.is_empty());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn remove_active_project_selects_a_surviving_project() {
+        let database = Database::in_memory();
+        database
+            .with_connection(|connection| {
+                let first = upsert_project(connection, &snapshot("C:\\one"), None, true)?;
+                let second = upsert_project(connection, &snapshot("C:\\two"), None, false)?;
+                let library = remove_project(connection, first.id)?;
+                assert_eq!(library.active_project_id, Some(second.id));
                 assert_eq!(library.projects.len(), 1);
-                assert_eq!(library.active_project_id, Some(original.id));
                 Ok(())
             })
             .unwrap();
     }
 
     #[test]
-    fn focus_validation_is_enforced_natively() {
+    fn relink_preserves_focus_and_rejects_duplicate_paths() {
         let database = Database::in_memory();
         database
             .with_connection(|connection| {
-                let project = upsert_project(connection, &snapshot("C:\\repo"), None, true)?;
-                assert!(update_focus(connection, project.id, "", "checkpoint").is_err());
-                assert!(update_focus(connection, project.id, "quest", "").is_err());
+                let first = upsert_project(connection, &snapshot("C:\\one"), None, true)?;
+                let second = upsert_project(connection, &snapshot("C:\\two"), None, false)?;
+                update_focus(connection, first.id, "Preserve me", "Still here")?;
+                let relinked = relink_project(connection, first.id, &snapshot("C:\\three"))?;
+                assert_eq!(relinked.quest, "Preserve me");
+                assert!(relink_project(connection, first.id, &snapshot("C:\\two")).is_err());
+                assert_eq!(project_by_id(connection, second.id)?.path, "C:\\two");
                 Ok(())
             })
             .unwrap();
     }
 
     #[test]
-    fn library_survives_closing_and_reopening_the_database() {
-        let storage = TestDatabase::new("reopen");
-        let project_id = {
-            let database = Database::open(&storage.path).unwrap();
-            database
-                .with_connection(|connection| {
-                    let project =
-                        upsert_project(connection, &snapshot("C:\\durable-project"), None, true)?;
-                    update_focus(
-                        connection,
-                        project.id,
-                        "Persist the library",
-                        "Close and reopen the SQLite connection.",
-                    )?;
-                    mark_opened(connection, project.id)?;
-                    Ok(project.id)
-                })
-                .unwrap()
-        };
-
-        let reopened = Database::open(&storage.path).unwrap();
-        let library = reopened
-            .with_connection(|connection| load_library(connection))
+    fn online_backup_contains_the_library() {
+        let storage = TestDatabase::new("backup");
+        let backup_path = storage.directory.join("backup.sqlite3");
+        let database = Database::open(&storage.path).unwrap();
+        database
+            .with_connection(|connection| {
+                upsert_project(connection, &snapshot("C:\\durable"), None, true)?;
+                backup_database(connection, &backup_path)
+            })
             .unwrap();
-        assert_eq!(library.active_project_id, Some(project_id));
-        assert_eq!(library.projects.len(), 1);
-        assert_eq!(library.projects[0].quest, "Persist the library");
+        let backup = Database::open(&backup_path).unwrap();
         assert_eq!(
-            library.projects[0].checkpoint,
-            "Close and reopen the SQLite connection."
+            backup
+                .with_connection(|connection| Ok(load_library(connection)?.projects.len()))
+                .unwrap(),
+            1
         );
-        assert!(library.projects[0].last_opened_at.is_some());
     }
 
     #[test]
-    fn focus_updates_trim_input_and_count_unicode_characters() {
-        let database = Database::in_memory();
-        database
-            .with_connection(|connection| {
-                let project = upsert_project(connection, &snapshot("C:\\repo"), None, true)?;
-                let updated = update_focus(
-                    connection,
-                    project.id,
-                    "  Ship safely  ",
-                    "  Preserve the user's context.  ",
-                )?;
-                assert_eq!(updated.quest, "Ship safely");
-                assert_eq!(updated.checkpoint, "Preserve the user's context.");
-                assert!(update_focus(connection, project.id, &"🌸".repeat(121), "valid").is_err());
-                assert!(update_focus(connection, project.id, "valid", &"🌱".repeat(181)).is_err());
-                Ok(())
-            })
-            .unwrap();
-    }
-
-    #[test]
-    fn newer_database_versions_fail_without_mutating_the_file() {
-        let storage = TestDatabase::new("future-version");
+    fn newer_database_versions_are_rejected_without_mutation() {
+        let storage = TestDatabase::new("future");
         let connection = Connection::open(&storage.path).unwrap();
         connection
             .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
             .unwrap();
         drop(connection);
-
-        let error = match Database::open(&storage.path) {
-            Ok(_) => panic!("future database versions must be rejected"),
-            Err(error) => error,
-        };
-        assert_eq!(
-            error,
-            "This Launchpad library was created by a newer app version."
-        );
+        assert!(Database::open(&storage.path).is_err());
         let connection = Connection::open(&storage.path).unwrap();
-        let version = connection
-            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION + 1);
+        assert_eq!(
+            connection
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION + 1
+        );
     }
 }
