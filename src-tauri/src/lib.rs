@@ -36,7 +36,7 @@ struct BackupResult {
     file_name: String,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RawDatabasePresence {
     main: bool,
     wal: bool,
@@ -386,9 +386,9 @@ fn snapshot_backup_file(source: &Path, destination: &Path) -> Result<(), String>
     let source_connection =
         rusqlite::Connection::open_with_flags(source, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| {
-                eprintln!("Launchpad restore source open failed: {error}");
-                "That file is not a readable Launchpad backup.".to_string()
-            })?;
+            eprintln!("Launchpad restore source open failed: {error}");
+            "That file is not a readable Launchpad backup.".to_string()
+        })?;
     backup_database(&source_connection, destination)?;
     drop(source_connection);
     validate_backup_file(destination).map(|_| ())
@@ -408,6 +408,20 @@ fn database_sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut value = OsString::from(path.as_os_str());
     value.push(suffix);
     PathBuf::from(value)
+}
+
+fn raw_database_pairs(source: &Path, destination: &Path) -> [(PathBuf, PathBuf); 3] {
+    [
+        (
+            database_sidecar(source, "-wal"),
+            database_sidecar(destination, "-wal"),
+        ),
+        (
+            database_sidecar(source, "-shm"),
+            database_sidecar(destination, "-shm"),
+        ),
+        (source.to_path_buf(), destination.to_path_buf()),
+    ]
 }
 
 fn copy_if_exists(source: &Path, destination: &Path) -> Result<bool, String> {
@@ -455,39 +469,65 @@ fn clear_raw_database(path: &Path) -> Result<(), String> {
     remove_if_exists(path)
 }
 
-fn restore_raw_database(
-    safety_path: &Path,
-    live_path: &Path,
-    presence: RawDatabasePresence,
-) -> Result<(), String> {
-    clear_raw_database(live_path)?;
-    if presence.main {
-        fs::copy(safety_path, live_path).map_err(|error| {
-            eprintln!("Launchpad raw rollback failed: {error}");
-            "Launchpad could not restore its original library file.".to_string()
-        })?;
+fn move_raw_database_with<F>(
+    source: &Path,
+    destination: &Path,
+    mut rename: F,
+) -> Result<RawDatabasePresence, String>
+where
+    F: FnMut(&Path, &Path) -> std::io::Result<()>,
+{
+    let pairs = raw_database_pairs(source, destination);
+    if pairs
+        .iter()
+        .any(|(_, destination_file)| destination_file.exists())
+    {
+        return Err("Launchpad found an unexpected recovery quarantine collision.".to_string());
     }
-    if presence.wal {
-        fs::copy(
-            database_sidecar(safety_path, "-wal"),
-            database_sidecar(live_path, "-wal"),
-        )
-        .map_err(|error| {
-            eprintln!("Launchpad WAL rollback failed: {error}");
-            "Launchpad could not restore its original library WAL file.".to_string()
-        })?;
+
+    let mut moved = Vec::<(PathBuf, PathBuf)>::new();
+    let mut presence = RawDatabasePresence {
+        main: false,
+        wal: false,
+        shm: false,
+    };
+
+    for (index, (source_file, destination_file)) in pairs.iter().enumerate() {
+        if !source_file.exists() {
+            continue;
+        }
+        if let Err(error) = rename(source_file, destination_file) {
+            eprintln!("Launchpad recovery quarantine move failed: {error}");
+            let mut rollback_failed = false;
+            for (original, quarantined) in moved.iter().rev() {
+                if let Err(rollback_error) = rename(quarantined, original) {
+                    eprintln!("Launchpad recovery quarantine rollback failed: {rollback_error}");
+                    rollback_failed = true;
+                }
+            }
+            return Err(if rollback_failed {
+                "Launchpad could not safely quarantine its library and could not fully undo the partial move. The safety backup was left untouched. Restart Launchpad before trying recovery again."
+                    .to_string()
+            } else {
+                "Launchpad could not safely quarantine its library. The original files were put back and the safety backup was left untouched."
+                    .to_string()
+            });
+        }
+
+        match index {
+            0 => presence.wal = true,
+            1 => presence.shm = true,
+            2 => presence.main = true,
+            _ => unreachable!(),
+        }
+        moved.push((source_file.clone(), destination_file.clone()));
     }
-    if presence.shm {
-        fs::copy(
-            database_sidecar(safety_path, "-shm"),
-            database_sidecar(live_path, "-shm"),
-        )
-        .map_err(|error| {
-            eprintln!("Launchpad SHM rollback failed: {error}");
-            "Launchpad could not restore its original library SHM file.".to_string()
-        })?;
-    }
-    Ok(())
+
+    Ok(presence)
+}
+
+fn move_raw_database(source: &Path, destination: &Path) -> Result<RawDatabasePresence, String> {
+    move_raw_database_with(source, destination, |from, to| fs::rename(from, to))
 }
 
 fn restore_with_rollback<F>(
@@ -551,9 +591,33 @@ where
     }
 
     let presence = copy_raw_database(&live_path, safety_path)?;
+    let quarantine_path =
+        live_parent.join(timestamped_backup_name("launchpad-recovery-quarantine")?);
+    let quarantined = match move_raw_database(&live_path, &quarantine_path) {
+        Ok(quarantined) => quarantined,
+        Err(error) => {
+            let _ = clear_raw_database(&stage_path);
+            return Err(error);
+        }
+    };
+    if quarantined != presence {
+        let rollback = move_raw_database(&quarantine_path, &live_path);
+        let _ = clear_raw_database(&stage_path);
+        if let Err(rollback_error) = rollback {
+            eprintln!("Launchpad recovery race rollback failed: {rollback_error}");
+            return Err(
+                "Launchpad's library files changed during recovery and could not be put back automatically. The safety backup is preserved. Restart Launchpad before trying again."
+                    .to_string(),
+            );
+        }
+        return Err(
+            "Launchpad's library files changed during recovery. Close any other program using the library and try again."
+                .to_string(),
+        );
+    }
+
     let attempt = (|| {
         database.mark_unavailable(original_error.clone())?;
-        clear_raw_database(&live_path)?;
         fs::rename(&stage_path, &live_path).map_err(|error| {
             eprintln!("Launchpad restore install failed: {error}");
             "Launchpad could not install that backup safely.".to_string()
@@ -563,19 +627,55 @@ where
     })();
 
     match attempt {
-        Ok(library) => Ok(library),
+        Ok(library) => {
+            if let Err(error) = clear_raw_database(&quarantine_path) {
+                eprintln!("Launchpad recovery quarantine cleanup failed: {error}");
+            }
+            let _ = clear_raw_database(&stage_path);
+            Ok(library)
+        }
         Err(restore_error) => {
             let _ = database.mark_unavailable(original_error.clone());
-            let rollback = restore_raw_database(safety_path, &live_path, presence);
-            let _ = clear_raw_database(&stage_path);
-            if let Err(rollback_error) = rollback {
-                eprintln!("Launchpad raw recovery rollback failed: {rollback_error}");
+            let failed_path =
+                live_parent.join(timestamped_backup_name("launchpad-failed-restore")?);
+            if let Err(move_error) = move_raw_database(&live_path, &failed_path) {
+                eprintln!("Launchpad failed-restore quarantine failed: {move_error}");
+                let _ = clear_raw_database(&stage_path);
                 return Err(
-                    "Restore failed and Launchpad could not put the original library files back automatically. Keep the safety backup and restart Launchpad."
+                    "Restore failed and Launchpad could not move the failed replacement out of the way. Your original library is still preserved in the recovery quarantine and safety backup. Restart Launchpad before trying again."
                         .to_string(),
                 );
             }
-            Err(restore_error)
+
+            match move_raw_database(&quarantine_path, &live_path) {
+                Ok(restored_presence) if restored_presence == quarantined => {
+                    if let Err(error) = clear_raw_database(&failed_path) {
+                        eprintln!("Launchpad failed-restore cleanup failed: {error}");
+                    }
+                    let _ = clear_raw_database(&stage_path);
+                    Err(restore_error)
+                }
+                Ok(_) => {
+                    let _ = clear_raw_database(&stage_path);
+                    Err(
+                        "Restore failed and Launchpad could not verify that every original library file was put back. The safety backup is preserved; restart Launchpad before trying again."
+                            .to_string(),
+                    )
+                }
+                Err(rollback_error) => {
+                    eprintln!("Launchpad quarantine rollback failed: {rollback_error}");
+                    if let Err(failed_restore_error) = move_raw_database(&failed_path, &live_path) {
+                        eprintln!(
+                            "Launchpad could not put the failed replacement back either: {failed_restore_error}"
+                        );
+                    }
+                    let _ = clear_raw_database(&stage_path);
+                    Err(
+                        "Restore failed and Launchpad could not automatically put the original library back. The original files remain preserved in the recovery quarantine and safety backup. Restart Launchpad before trying again."
+                            .to_string(),
+                    )
+                }
+            }
         }
     }
 }
@@ -907,6 +1007,35 @@ mod tests {
             .projects
             .iter()
             .any(|project| project.name == "WAL Project"));
+    }
+
+    #[test]
+    fn raw_quarantine_rolls_back_a_partial_move_failure() {
+        let storage = TestDirectory::new("quarantine-partial-failure");
+        let source = storage.0.join("live.sqlite3");
+        let quarantine = storage.0.join("quarantine.sqlite3");
+        fs::write(&source, b"main").unwrap();
+        fs::write(database_sidecar(&source, "-wal"), b"wal").unwrap();
+        fs::write(database_sidecar(&source, "-shm"), b"shm").unwrap();
+
+        let mut calls = 0;
+        let error = move_raw_database_with(&source, &quarantine, |from, to| {
+            calls += 1;
+            if calls == 2 {
+                Err(std::io::Error::other("forced rename failure"))
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .unwrap_err();
+
+        assert!(error.contains("original files were put back"));
+        assert_eq!(fs::read(&source).unwrap(), b"main");
+        assert_eq!(fs::read(database_sidecar(&source, "-wal")).unwrap(), b"wal");
+        assert_eq!(fs::read(database_sidecar(&source, "-shm")).unwrap(), b"shm");
+        assert!(!quarantine.exists());
+        assert!(!database_sidecar(&quarantine, "-wal").exists());
+        assert!(!database_sidecar(&quarantine, "-shm").exists());
     }
 
     #[test]
