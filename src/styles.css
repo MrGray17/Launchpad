@@ -7,7 +7,7 @@
   text-rendering: optimizeLegibility;
 
   --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
-  --font-display: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+  --font-display: Constantia, "Palatino Linotype", "Book Antiqua", Georgia, serif;
   --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, monospace;
 
   --paper: #f3eee7;
@@ -375,18 +375,6 @@ main { width: min(1180px, 91vw); margin: 0 auto; padding: 72px 0 84px; }
   padding: 34px 42px 30px;
   display: flex;
   flex-direction: column;
-  position: relative;
-}
-.focus-copy::before {
-  content: "ACTIVE / 01";
-  position: absolute;
-  right: 42px;
-  bottom: 30px;
-  color: var(--quiet);
-  font-family: var(--font-mono);
-  font-size: 9px;
-  letter-spacing: .12em;
-  opacity: .62;
 }
 .focus-topline {
   display: flex;
@@ -469,7 +457,6 @@ main { width: min(1180px, 91vw); margin: 0 auto; padding: 72px 0 84px; }
   align-items: end;
   margin-top: 24px;
   padding-top: 18px;
-  padding-bottom: 20px;
   border-top: 1px solid var(--hairline);
 }
 .focus-meta div { min-width: 0; }
@@ -747,7 +734,6 @@ main { width: min(1180px, 91vw); margin: 0 auto; padding: 72px 0 84px; }
   .focus-visual { border-right: 0; border-bottom: 1px solid var(--hairline); }
   .focus-visual .project-art { min-height: 270px; }
   .focus-project-name { align-items: flex-end; }
-  .focus-copy::before { display: none; }
 }
 
 @media (max-width: 680px) {
@@ -758,7 +744,7 @@ main { width: min(1180px, 91vw); margin: 0 auto; padding: 72px 0 84px; }
   .focus-copy { padding: 28px 24px 26px; }
   .focus-topline { margin-bottom: 34px; }
   .focus-copy h2 { font-size: 36px; }
-  .focus-meta { grid-template-columns: 1fr 1fr; padding-bottom: 0; }
+  .focus-meta { grid-template-columns: 1fr 1fr; }
   .focus-meta > button { grid-column: 1 / -1; justify-self: start; }
   .section-head { align-items: center; }
   .shelf { grid-template-columns: repeat(2, minmax(0,1fr)); gap: 14px 10px; }
