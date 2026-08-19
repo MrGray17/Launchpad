@@ -64,6 +64,27 @@ export async function chooseProjectFolder(): Promise<string | null> {
   return typeof selected === "string" ? selected : null;
 }
 
+export async function chooseBackupFile(): Promise<string | null> {
+  if (!isDesktopRuntime()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    directory: false,
+    multiple: false,
+    filters: [{ name: "Launchpad backup", extensions: ["sqlite3"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function chooseBackupDestination(): Promise<string | null> {
+  if (!isDesktopRuntime()) return null;
+  const { save } = await import("@tauri-apps/plugin-dialog");
+  const selected = await save({
+    defaultPath: "launchpad-backup.sqlite3",
+    filters: [{ name: "Launchpad backup", extensions: ["sqlite3"] }],
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
 export function bootstrapLibrary(
   projects: LegacyProject[],
   activeLegacyId: string | null,
@@ -117,4 +138,12 @@ export function openTerminal(id: number): Promise<Project> {
 
 export function backupLibrary(): Promise<BackupResult> {
   return invoke<BackupResult>("backup_library");
+}
+
+export function exportLibrary(path: string): Promise<BackupResult> {
+  return invoke<BackupResult>("export_library", { path });
+}
+
+export function restoreLibrary(path: string): Promise<LibraryState> {
+  return invoke<LibraryState>("restore_library", { path });
 }

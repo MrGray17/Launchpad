@@ -6,13 +6,17 @@ import {
   addProject,
   backupLibrary,
   bootstrapLibrary,
+  chooseBackupDestination,
+  chooseBackupFile,
   chooseProjectFolder,
+  exportLibrary,
   isDesktopRuntime,
   openInCode,
   openTerminal,
   refreshProject,
   relinkProject,
   removeProject,
+  restoreLibrary,
   saveProjectFocus,
 } from "./desktop";
 
@@ -20,10 +24,11 @@ const native = vi.hoisted(() => ({
   invoke: vi.fn(),
   isTauri: vi.fn(() => true),
   open: vi.fn(),
+  save: vi.fn(),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: native.invoke, isTauri: native.isTauri }));
-vi.mock("@tauri-apps/plugin-dialog", () => ({ open: native.open }));
+vi.mock("@tauri-apps/plugin-dialog", () => ({ open: native.open, save: native.save }));
 
 describe("desktop platform boundary", () => {
   beforeEach(() => {
@@ -31,11 +36,12 @@ describe("desktop platform boundary", () => {
     native.isTauri.mockReturnValue(true);
     native.invoke.mockResolvedValue(undefined);
     native.open.mockResolvedValue(null);
+    native.save.mockResolvedValue(null);
   });
 
   afterEach(() => vi.restoreAllMocks());
 
-  it("maps the reduced project API to exact native commands and id-based payloads", async () => {
+  it("maps the narrow project and recovery API to exact native commands", async () => {
     const legacy = [{ legacyId: "old", path: "C:\\repo", quest: "Ship" }];
     await bootstrapLibrary(legacy, "old");
     await addProject("C:\\repo");
@@ -47,6 +53,8 @@ describe("desktop platform boundary", () => {
     await openInCode(4);
     await openTerminal(4);
     await backupLibrary();
+    await exportLibrary("D:\\launchpad-backup.sqlite3");
+    await restoreLibrary("D:\\launchpad-backup.sqlite3");
 
     expect(native.invoke.mock.calls).toEqual([
       ["bootstrap", { projects: legacy, activeLegacyId: "old" }],
@@ -59,15 +67,30 @@ describe("desktop platform boundary", () => {
       ["open_in_vscode", { id: 4 }],
       ["open_terminal", { id: 4 }],
       ["backup_library", undefined],
+      ["export_library", { path: "D:\\launchpad-backup.sqlite3" }],
+      ["restore_library", { path: "D:\\launchpad-backup.sqlite3" }],
     ]);
   });
 
-  it("uses the public Tauri runtime API and configures one-directory picking", async () => {
-    native.open.mockResolvedValue("C:\\repo");
+  it("uses native dialogs for folders, backup import, and backup export", async () => {
+    native.open.mockResolvedValueOnce("C:\\repo").mockResolvedValueOnce("D:\\backup.sqlite3");
+    native.save.mockResolvedValue("D:\\export.sqlite3");
+
     expect(isDesktopRuntime()).toBe(true);
     await expect(chooseProjectFolder()).resolves.toBe("C:\\repo");
-    expect(native.isTauri).toHaveBeenCalled();
-    expect(native.open).toHaveBeenCalledWith({ directory: true, multiple: false });
+    await expect(chooseBackupFile()).resolves.toBe("D:\\backup.sqlite3");
+    await expect(chooseBackupDestination()).resolves.toBe("D:\\export.sqlite3");
+
+    expect(native.open).toHaveBeenNthCalledWith(1, { directory: true, multiple: false });
+    expect(native.open).toHaveBeenNthCalledWith(2, {
+      directory: false,
+      multiple: false,
+      filters: [{ name: "Launchpad backup", extensions: ["sqlite3"] }],
+    });
+    expect(native.save).toHaveBeenCalledWith({
+      defaultPath: "launchpad-backup.sqlite3",
+      filters: [{ name: "Launchpad backup", extensions: ["sqlite3"] }],
+    });
   });
 
   it("keeps browser preview read-only and never attempts native IPC", async () => {
@@ -77,10 +100,13 @@ describe("desktop platform boundary", () => {
       projects: [], activeProjectId: null, pendingLegacyIds: [], legacyMigrationComplete: true,
     });
     await expect(chooseProjectFolder()).resolves.toBeNull();
+    await expect(chooseBackupFile()).resolves.toBeNull();
+    await expect(chooseBackupDestination()).resolves.toBeNull();
     await expect(addProject("C:\\repo")).rejects.toThrow(
       "This action is available in the Launchpad desktop app.",
     );
     expect(native.invoke).not.toHaveBeenCalled();
     expect(native.open).not.toHaveBeenCalled();
+    expect(native.save).not.toHaveBeenCalled();
   });
 });

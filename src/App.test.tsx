@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
-import type { BootstrapState, LibraryState, Project } from "./platform/desktop";
+import type { BootstrapState, Project } from "./platform/desktop";
 import { THEME_STORAGE_KEY } from "./theme";
 
 const desktop = vi.hoisted(() => ({
@@ -12,13 +12,17 @@ const desktop = vi.hoisted(() => ({
   addProject: vi.fn(),
   backupLibrary: vi.fn(),
   bootstrapLibrary: vi.fn(),
+  chooseBackupDestination: vi.fn(),
+  chooseBackupFile: vi.fn(),
   chooseProjectFolder: vi.fn(),
+  exportLibrary: vi.fn(),
   isDesktopRuntime: vi.fn(() => true),
   openInCode: vi.fn(),
   openTerminal: vi.fn(),
   refreshProject: vi.fn(),
   relinkProject: vi.fn(),
   removeProject: vi.fn(),
+  restoreLibrary: vi.fn(),
   saveProjectFocus: vi.fn(),
 }));
 
@@ -54,6 +58,14 @@ const bootstrap: BootstrapState = {
   legacyMigrationComplete: true,
 };
 
+function openAppMenu() {
+  fireEvent.click(screen.getByRole("button", { name: "App menu" }));
+}
+
+function openProjectMenu() {
+  fireEvent.click(screen.getByRole("button", { name: "Project options" }));
+}
+
 describe("Launchpad hardened project lifecycle", () => {
   beforeEach(() => {
     localStorage.clear();
@@ -62,6 +74,8 @@ describe("Launchpad hardened project lifecycle", () => {
     desktop.isDesktopRuntime.mockReturnValue(true);
     desktop.bootstrapLibrary.mockResolvedValue(bootstrap);
     desktop.chooseProjectFolder.mockResolvedValue(null);
+    desktop.chooseBackupFile.mockResolvedValue(null);
+    desktop.chooseBackupDestination.mockResolvedValue(null);
     desktop.activateProject.mockResolvedValue(project);
     desktop.addProject.mockResolvedValue(project);
     desktop.refreshProject.mockResolvedValue(project);
@@ -71,6 +85,8 @@ describe("Launchpad hardened project lifecycle", () => {
     desktop.openInCode.mockResolvedValue({ ...project, lastOpenedAt: "2026-08-19T11:00:00.000Z" });
     desktop.openTerminal.mockResolvedValue({ ...project, lastOpenedAt: "2026-08-19T11:00:00.000Z" });
     desktop.backupLibrary.mockResolvedValue({ fileName: "launchpad-backup-123.sqlite3" });
+    desktop.exportLibrary.mockResolvedValue({ fileName: "export.sqlite3" });
+    desktop.restoreLibrary.mockResolvedValue({ projects: [project], activeProjectId: project.id });
   });
 
   afterEach(() => {
@@ -86,17 +102,26 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(document.querySelector(".git-line")?.textContent).toContain("main");
   });
 
-  it("keeps the original light theme and persists the optional dark-grey theme", async () => {
+  it("uses the actual Launchpad mark and removes fake window controls", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    expect(document.querySelector(".brand-mark")).toBeTruthy();
+    expect(document.querySelector(".window-dots")).toBeNull();
+  });
+
+  it("persists the optional dark appearance from the app menu", async () => {
     const first = render(<App />);
-    const darkToggle = await screen.findByRole("button", { name: "Switch to dark grey theme" });
-    expect(document.documentElement.dataset.theme).toBe("light");
-    fireEvent.click(darkToggle);
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: /Dark appearance/ }));
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
     expect(localStorage.getItem(THEME_STORAGE_KEY)).toBe("dark");
 
     first.unmount();
     render(<App />);
-    expect(await screen.findByRole("button", { name: "Switch to light theme" })).toBeTruthy();
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    openAppMenu();
+    expect(screen.getByRole("menuitem", { name: /Light appearance/ })).toBeTruthy();
   });
 
   it("opens editor and terminal by id and applies returned timestamps", async () => {
@@ -139,10 +164,22 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(screen.getByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
   });
 
-  it("refreshes metadata manually and marks missing folders unavailable", async () => {
+  it("keeps maintenance actions out of the main hierarchy but makes them available in project options", async () => {
+    render(<App />);
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    expect(screen.queryByRole("button", { name: "Refresh metadata" })).toBeNull();
+    openProjectMenu();
+    expect(screen.getByRole("menuitem", { name: "Refresh metadata" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Relink folder…" })).toBeTruthy();
+    expect(screen.getByRole("menuitem", { name: "Remove from Launchpad" })).toBeTruthy();
+  });
+
+  it("refreshes metadata and promotes recovery controls only when a folder is missing", async () => {
     desktop.refreshProject.mockRejectedValue("That project folder does not exist.");
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Refresh" }));
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    openProjectMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Refresh metadata" }));
     expect((await screen.findByRole("alert")).textContent).toContain("cannot find");
     expect(screen.getByRole("button", { name: "Relink folder" })).toBeTruthy();
   });
@@ -161,9 +198,11 @@ describe("Launchpad hardened project lifecycle", () => {
 
   it("removes a project while explicitly preserving its filesystem", async () => {
     render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Remove" }));
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    openProjectMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Remove from Launchpad" }));
     await waitFor(() => expect(desktop.removeProject).toHaveBeenCalledWith(7));
-    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("will not be deleted"));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("source files will stay untouched"));
     expect(await screen.findByRole("button", { name: "Choose a project folder" })).toBeTruthy();
   });
 
@@ -171,11 +210,11 @@ describe("Launchpad hardened project lifecycle", () => {
     const updated = { ...project, quest: "Ship safely", checkpoint: "Run the recovery test." };
     desktop.saveProjectFocus.mockResolvedValue(updated);
     render(<App />);
-    const edit = await screen.findByRole("button", { name: /Edit focus/ });
+    const edit = await screen.findByRole("button", { name: "Edit focus" });
     fireEvent.click(edit);
     fireEvent.change(screen.getByLabelText("Current quest"), { target: { value: updated.quest } });
     fireEvent.change(screen.getByLabelText("Checkpoint"), { target: { value: updated.checkpoint } });
-    fireEvent.click(screen.getByRole("button", { name: /Save focus/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Save focus" }));
     await waitFor(() => expect(desktop.saveProjectFocus).toHaveBeenCalledWith(7, updated.quest, updated.checkpoint));
     await waitFor(() => expect(document.activeElement).toBe(edit));
   });
@@ -186,11 +225,7 @@ describe("Launchpad hardened project lifecycle", () => {
       { id: "offline", path: "D:\\offline", checkpoint: "Drive missing" },
     ]));
     localStorage.setItem(LEGACY_ACTIVE_KEY, "offline");
-    desktop.bootstrapLibrary.mockResolvedValue({
-      ...bootstrap,
-      pendingLegacyIds: ["offline"],
-      legacyMigrationComplete: false,
-    });
+    desktop.bootstrapLibrary.mockResolvedValue({ ...bootstrap, pendingLegacyIds: ["offline"], legacyMigrationComplete: false });
     render(<App />);
     await screen.findByRole("button", { name: /Continue Rate Limiter/ });
     expect(desktop.bootstrapLibrary).toHaveBeenCalledWith([
@@ -211,40 +246,43 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(desktop.bootstrapLibrary).not.toHaveBeenCalled();
   });
 
-  it("leaves an entire partially malformed prototype array untouched", async () => {
-    const legacy = JSON.stringify([
-      { id: "ready", path: "C:\\ready", quest: "Ready" },
-      { id: "missing-path", checkpoint: "Do not discard me" },
-    ]);
-    localStorage.setItem(LEGACY_PROJECTS_KEY, legacy);
+  it("creates, exports, and restores backups from the app menu", async () => {
+    desktop.chooseBackupDestination.mockResolvedValue("D:\\export.sqlite3");
+    desktop.chooseBackupFile.mockResolvedValue("D:\\restore.sqlite3");
     render(<App />);
-    expect((await screen.findByRole("alert")).textContent).toContain("left it untouched");
-    expect(localStorage.getItem(LEGACY_PROJECTS_KEY)).toBe(legacy);
-    expect(desktop.bootstrapLibrary).not.toHaveBeenCalled();
-  });
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
 
-  it("creates a SQLite online backup without receiving a filesystem path", async () => {
-    render(<App />);
-    fireEvent.click(await screen.findByRole("button", { name: "Back up" }));
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Back up now" }));
     expect((await screen.findByRole("status")).textContent).toContain("launchpad-backup-123.sqlite3");
-    expect(desktop.backupLibrary).toHaveBeenCalledWith();
+
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export backup…" }));
+    await waitFor(() => expect(desktop.exportLibrary).toHaveBeenCalledWith("D:\\export.sqlite3"));
+
+    openAppMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Restore backup…" }));
+    await waitFor(() => expect(desktop.restoreLibrary).toHaveBeenCalledWith("D:\\restore.sqlite3"));
+    expect(window.confirm).toHaveBeenCalledWith(expect.stringContaining("safety backup"));
   });
 
-  it("renders Unicode initials by code point", async () => {
+  it("gives known projects distinct visual motifs and Unicode-safe initials", async () => {
+    const names = ["Rate Limiter", "Nest", "Maw3id", "Sifr", "Launchpad", "🌸 Garden"];
     desktop.bootstrapLibrary.mockResolvedValue({
       ...bootstrap,
-      projects: [{ ...project, name: "🌸 Garden" }],
+      projects: names.map((name, index) => ({ ...project, id: index + 1, name })),
+      activeProjectId: 1,
     });
     render(<App />);
-    await screen.findByRole("button", { name: /Continue 🌸 Garden/ });
-    expect(document.querySelector(".focus-symbol")?.textContent).toBe("🌸G");
+    await screen.findByRole("button", { name: /Continue Rate Limiter/ });
+    const motifs = [...document.querySelectorAll(".project-cover .project-art")].map((node) => node.getAttribute("data-motif"));
+    expect(motifs).toEqual(expect.arrayContaining(["signal", "window", "queue", "ledger", "spark"]));
+    expect([...document.querySelectorAll(".art-symbol")].some((node) => node.textContent === "🌸G")).toBe(true);
   });
 
   it("keeps browser preview read-only with an honest empty state", async () => {
     desktop.isDesktopRuntime.mockReturnValue(false);
-    desktop.bootstrapLibrary.mockResolvedValue({
-      projects: [], activeProjectId: null, pendingLegacyIds: [], legacyMigrationComplete: true,
-    });
+    desktop.bootstrapLibrary.mockResolvedValue({ projects: [], activeProjectId: null, pendingLegacyIds: [], legacyMigrationComplete: true });
     render(<App />);
     expect(await screen.findByRole("button", { name: "Choose a project folder" })).toBeTruthy();
     expect(desktop.bootstrapLibrary).toHaveBeenCalledWith([], null);

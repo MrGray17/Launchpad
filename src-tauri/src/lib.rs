@@ -1,5 +1,6 @@
 mod database;
 mod inspection;
+mod recovery;
 
 use database::{
     backup_database, finish_legacy_migration, legacy_migration_complete,
@@ -8,6 +9,7 @@ use database::{
     validate_legacy_project, Database, LegacyProject, LibraryState, Project,
 };
 use inspection::{canonical_project_path, inspect_project_path};
+use recovery::{restore_database, validate_backup_file};
 use serde::Serialize;
 use std::{
     fs,
@@ -66,6 +68,14 @@ fn refresh_project_record(
     })
 }
 
+fn refreshed_library(database: &Database) -> Result<LibraryState, String> {
+    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    if let Some(active_id) = library.active_project_id {
+        let _ = refresh_project_record(database, active_id, true, false);
+    }
+    database.with_connection(|connection| load_library_from_database(connection))
+}
+
 fn bootstrap_library(
     database: &Database,
     projects: Vec<LegacyProject>,
@@ -98,11 +108,7 @@ fn bootstrap_library(
         }
     }
 
-    let library = database.with_connection(|connection| load_library_from_database(connection))?;
-    if let Some(active_id) = library.active_project_id {
-        let _ = refresh_project_record(database, active_id, true, false);
-    }
-    let library = database.with_connection(|connection| load_library_from_database(connection))?;
+    let library = refreshed_library(database)?;
     let migration_complete =
         database.with_connection(|connection| legacy_migration_complete(connection))?;
     Ok(BootstrapState {
@@ -198,22 +204,50 @@ fn spawn_first_available(mut candidates: Vec<Command>, failure: &str) -> Result<
 
 fn editor_candidates(project_path: &Path) -> Vec<Command> {
     let mut candidates = Vec::new();
-    for executable in ["code.cmd", "code"] {
-        let mut command = Command::new(executable);
-        command.arg(project_path);
-        candidates.push(command);
-    }
+
     #[cfg(target_os = "windows")]
-    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
-        let mut command = Command::new(
-            PathBuf::from(local_app_data)
-                .join("Programs")
-                .join("Microsoft VS Code")
-                .join("Code.exe"),
-        );
+    {
+        if let Some(explicit) = std::env::var_os("LAUNCHPAD_VSCODE") {
+            let mut command = Command::new(explicit);
+            command.arg(project_path);
+            candidates.push(command);
+        }
+
+        let mut from_path = Command::new("Code.exe");
+        from_path.arg(project_path);
+        candidates.push(from_path);
+
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+            let mut command = Command::new(
+                PathBuf::from(local_app_data)
+                    .join("Programs")
+                    .join("Microsoft VS Code")
+                    .join("Code.exe"),
+            );
+            command.arg(project_path);
+            candidates.push(command);
+        }
+
+        for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+            if let Some(program_files) = std::env::var_os(variable) {
+                let mut command = Command::new(
+                    PathBuf::from(program_files)
+                        .join("Microsoft VS Code")
+                        .join("Code.exe"),
+                );
+                command.arg(project_path);
+                candidates.push(command);
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut command = Command::new("code");
         command.arg(project_path);
         candidates.push(command);
     }
+
     candidates
 }
 
@@ -257,12 +291,12 @@ fn open_project(database: &Database, id: i64, terminal: bool) -> Result<Project,
     if terminal {
         spawn_first_available(
             terminal_candidates(&canonical),
-            "No supported terminal could be opened. Install Windows Terminal, PowerShell, or another supported terminal.",
+            "No supported terminal could be opened. Install Windows Terminal or use PowerShell.",
         )?;
     } else {
         spawn_first_available(
             editor_candidates(&canonical),
-            "VS Code could not be opened. Install VS Code or enable its `code` command.",
+            "VS Code could not be opened. Install VS Code or set LAUNCHPAD_VSCODE to Code.exe.",
         )?;
     }
     database.with_connection(|connection| update_metadata(connection, id, &snapshot, false, true))
@@ -280,30 +314,102 @@ async fn open_terminal(id: i64, database: State<'_, Database>) -> Result<Project
     run_blocking(move || open_project(&database, id, true)).await
 }
 
+fn backup_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map_err(|_| "Launchpad could not locate its app-data folder.".to_string())
+        .map(|path| path.join("backups"))
+}
+
+fn timestamped_backup_name(prefix: &str) -> Result<String, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "Launchpad could not timestamp the backup.".to_string())?
+        .as_nanos();
+    Ok(format!("{prefix}-{timestamp}.sqlite3"))
+}
+
+fn write_backup(database: &Database, path: &Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|_| "Launchpad could not create the backup destination.".to_string())?;
+    }
+    database.with_connection(|connection| backup_database(connection, path))
+}
+
 #[tauri::command]
 async fn backup_library(
     app: tauri::AppHandle,
     database: State<'_, Database>,
 ) -> Result<BackupResult, String> {
-    let backup_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|_| "Launchpad could not locate its app-data folder.".to_string())?
-        .join("backups");
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|_| "Launchpad could not timestamp the backup.".to_string())?
-        .as_nanos();
-    let file_name = format!("launchpad-backup-{timestamp}.sqlite3");
+    let backup_dir = backup_directory(&app)?;
+    let file_name = timestamped_backup_name("launchpad-backup")?;
     let path = backup_dir.join(&file_name);
     let database = database.inner().clone();
-    run_blocking(move || {
-        fs::create_dir_all(&backup_dir)
-            .map_err(|_| "Launchpad could not create its backup folder.".to_string())?;
-        database.with_connection(|connection| backup_database(connection, &path))
+    run_blocking(move || write_backup(&database, &path)).await?;
+    Ok(BackupResult { file_name })
+}
+
+#[tauri::command]
+async fn export_library(path: String, database: State<'_, Database>) -> Result<BackupResult, String> {
+    let destination = PathBuf::from(path);
+    if destination.is_dir() {
+        return Err("Choose a backup file, not a folder.".to_string());
+    }
+    let file_name = destination
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("launchpad-backup.sqlite3")
+        .to_string();
+    let database = database.inner().clone();
+    run_blocking(move || write_backup(&database, &destination)).await?;
+    Ok(BackupResult { file_name })
+}
+
+#[tauri::command]
+async fn restore_library(
+    path: String,
+    app: tauri::AppHandle,
+    database: State<'_, Database>,
+) -> Result<LibraryState, String> {
+    let source = PathBuf::from(path);
+    let backup_dir = backup_directory(&app)?;
+    let safety_name = timestamped_backup_name("launchpad-before-restore")?;
+    let safety_path = backup_dir.join(safety_name);
+    let database = database.inner().clone();
+
+    run_blocking({
+        let database = database.clone();
+        let source = source.clone();
+        let safety_path = safety_path.clone();
+        move || {
+            validate_backup_file(&source)?;
+            fs::create_dir_all(
+                safety_path
+                    .parent()
+                    .ok_or_else(|| "Launchpad could not create a safety backup.".to_string())?,
+            )
+            .map_err(|_| "Launchpad could not create a safety backup.".to_string())?;
+
+            database.with_connection(|connection| {
+                backup_database(connection, &safety_path)?;
+                if let Err(restore_error) = restore_database(connection, &source) {
+                    if let Err(rollback_error) = restore_database(connection, &safety_path) {
+                        eprintln!("Launchpad restore rollback failed: {rollback_error}");
+                        return Err(
+                            "Restore failed and Launchpad could not automatically roll back. Keep the safety backup and restart Launchpad."
+                                .to_string(),
+                        );
+                    }
+                    return Err(restore_error);
+                }
+                load_library_from_database(connection)
+            })
+        }
     })
     .await?;
-    Ok(BackupResult { file_name })
+
+    run_blocking(move || refreshed_library(&database)).await
 }
 
 fn initialize_database(app: &tauri::AppHandle) -> Result<Database, Box<dyn std::error::Error>> {
@@ -339,7 +445,9 @@ pub fn run() {
             save_project_focus,
             open_in_vscode,
             open_terminal,
-            backup_library
+            backup_library,
+            export_library,
+            restore_library
         ])
         .run(tauri::generate_context!())
         .expect("error while running Launchpad");
@@ -421,5 +529,18 @@ mod tests {
         assert_eq!(state.projects.len(), 1);
         assert_eq!(state.active_project_id, Some(state.projects[0].id));
         assert_eq!(state.projects[0].quest, "Keep this quest");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn vscode_candidates_never_use_shell_script_shims() {
+        let project = Path::new("C:\\repo");
+        assert!(editor_candidates(project).iter().all(|command| {
+            !command
+                .get_program()
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .ends_with(".cmd")
+        }));
     }
 }

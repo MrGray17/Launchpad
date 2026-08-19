@@ -1,16 +1,20 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   activateProject as activateProjectInLibrary,
   addProject as addProjectToLibrary,
   backupLibrary,
   bootstrapLibrary,
+  chooseBackupDestination,
+  chooseBackupFile,
   chooseProjectFolder,
+  exportLibrary,
   isDesktopRuntime,
   openInCode,
   openTerminal,
   refreshProject as refreshProjectInLibrary,
   relinkProject as relinkProjectInLibrary,
   removeProject as removeProjectFromLibrary,
+  restoreLibrary,
   saveProjectFocus,
   type LegacyProject,
   type LibraryState,
@@ -20,7 +24,19 @@ import {
 import { applyTheme, readTheme, type Theme } from "./theme";
 
 type Mood = "sakura" | "mint" | "sky" | "amber" | "night";
-type Operation = "add" | "activate" | "refresh" | "relink" | "remove" | "continue" | "terminal" | "save" | "backup";
+type Motif = "signal" | "window" | "queue" | "ledger" | "spark" | "orbit";
+type Operation =
+  | "add"
+  | "activate"
+  | "refresh"
+  | "relink"
+  | "remove"
+  | "continue"
+  | "terminal"
+  | "save"
+  | "backup"
+  | "export"
+  | "restore";
 type FocusEditor = { projectId: number; quest: string; checkpoint: string };
 
 const LEGACY_PROJECTS_KEY = "launchpad.projects.v1";
@@ -110,15 +126,66 @@ async function bootstrapApp() {
   return state;
 }
 
+function hashName(name: string) {
+  return [...name].reduce((hash, character) => ((hash * 31) + character.codePointAt(0)!) >>> 0, 17);
+}
+
 function moodFromName(name: string): Mood {
   const moods: Mood[] = ["sakura", "mint", "sky", "amber", "night"];
-  const score = [...name].reduce((sum, character) => sum + character.charCodeAt(0), 0);
-  return moods[score % moods.length];
+  return moods[hashName(name) % moods.length];
+}
+
+function motifFromName(name: string): Motif {
+  const normalized = name.toLowerCase();
+  if (normalized.includes("rate") || normalized.includes("limit")) return "signal";
+  if (normalized.includes("nest") || normalized.includes("garden")) return "window";
+  if (normalized.includes("maw") || normalized.includes("queue") || normalized.includes("clinic")) return "queue";
+  if (normalized.includes("sifr") || normalized.includes("ledger") || normalized.includes("finance")) return "ledger";
+  if (normalized.includes("launchpad")) return "spark";
+  const motifs: Motif[] = ["orbit", "signal", "window", "ledger"];
+  return motifs[hashName(name) % motifs.length];
 }
 
 function projectSymbol(name: string) {
   const words = name.trim().split(/[\s_-]+/).filter(Boolean);
   return words.slice(0, 2).map((word) => [...word][0]).join("").toUpperCase() || "✦";
+}
+
+function projectVisualStyle(name: string): CSSProperties {
+  const hash = hashName(name);
+  return {
+    "--seed-a": `${18 + (hash % 65)}%`,
+    "--seed-b": `${16 + ((hash >> 5) % 68)}%`,
+    "--tilt": `${((hash >> 11) % 9) - 4}deg`,
+  } as CSSProperties;
+}
+
+function BrandMark() {
+  return (
+    <svg className="brand-mark" viewBox="0 0 1024 1024" aria-hidden="true">
+      <circle cx="512" cy="512" r="332" />
+      <path d="M512 244c24 150 118 244 268 268-150 24-244 118-268 268-24-150-118-244-268-268 150-24 244-118 268-268Z" />
+      <circle className="brand-mark-dot" cx="744" cy="292" r="58" />
+    </svg>
+  );
+}
+
+function ProjectArtwork({ project, compact = false }: { project: Project; compact?: boolean }) {
+  const motif = motifFromName(project.name);
+  return (
+    <div
+      className={`project-art mood-${moodFromName(project.name)} motif-${motif} ${compact ? "compact" : ""}`}
+      style={projectVisualStyle(project.name)}
+      data-motif={motif}
+      aria-hidden="true"
+    >
+      <span className="art-symbol">{projectSymbol(project.name)}</span>
+      <span className="art-shape art-shape-a" />
+      <span className="art-shape art-shape-b" />
+      <span className="art-shape art-shape-c" />
+      <span className="art-grid" />
+    </div>
+  );
 }
 
 function metadataLabel(status: MetadataStatus) {
@@ -134,12 +201,12 @@ function metadataLabel(status: MetadataStatus) {
 }
 
 function projectTagline(project: Project) {
-  if (!project.available) return "Folder unavailable — relink or remove.";
-  if (project.metadataStatus === "timeout") return "Git inspection took too long.";
-  if (project.metadataStatus === "git-unavailable") return "Git is not available on PATH.";
-  if (project.gitStatus === "clean") return "Ready when you are.";
-  if (project.gitStatus === "dirty") return "Work in progress.";
-  return "A local world of its own.";
+  if (!project.available) return "Folder unavailable";
+  if (project.metadataStatus === "timeout") return "Git inspection timed out";
+  if (project.metadataStatus === "git-unavailable") return "Git unavailable";
+  if (project.gitStatus === "clean") return "Ready when you are";
+  if (project.gitStatus === "dirty") return "Work in progress";
+  return "Local project";
 }
 
 function relativeDate(value: string | null, now: Date) {
@@ -175,11 +242,10 @@ export default function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [now, setNow] = useState(() => new Date());
   const [theme, setTheme] = useState<Theme>(readTheme);
+  const [appMenuOpen, setAppMenuOpen] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const operationRef = useRef<Operation | null>(null);
-  const bootstrapRequestRef = useRef<{
-    key: number;
-    promise: ReturnType<typeof bootstrapApp>;
-  } | null>(null);
+  const bootstrapRequestRef = useRef<{ key: number; promise: ReturnType<typeof bootstrapApp> } | null>(null);
   const focusModalRef = useRef<HTMLElement>(null);
   const editFocusButtonRef = useRef<HTMLButtonElement>(null);
 
@@ -223,15 +289,16 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (!focusEditor) return;
-    const modal = focusModalRef.current;
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
-        event.preventDefault();
-        closeFocusEditor();
+        if (focusEditor) closeFocusEditor();
+        setAppMenuOpen(false);
+        setProjectMenuOpen(false);
         return;
       }
-      if (event.key !== "Tab" || !modal) return;
+      if (event.key !== "Tab" || !focusEditor) return;
+      const modal = focusModalRef.current;
+      if (!modal) return;
       const focusable = [...modal.querySelectorAll<HTMLElement>(
         "button:not([disabled]), input:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex='-1'])",
       )];
@@ -289,7 +356,7 @@ export default function App() {
           projects: [project, ...current.projects.filter((item) => item.id !== project.id)],
           activeProjectId: project.id,
         } : { projects: [project], activeProjectId: project.id });
-        setToast(`${project.name} is ready.`);
+        setToast(`${project.name} added.`);
       } catch (error) {
         setToast(errorMessage(error, "Could not add that project."));
       }
@@ -313,6 +380,7 @@ export default function App() {
   }
 
   async function refreshProject(project: Project) {
+    setProjectMenuOpen(false);
     await runExclusive("refresh", async () => {
       try {
         const refreshed = await refreshProjectInLibrary(project.id);
@@ -320,7 +388,7 @@ export default function App() {
           ...current,
           projects: replaceProject(current.projects, refreshed),
         } : current);
-        setToast(`${refreshed.name} is up to date.`);
+        setToast(`${refreshed.name} refreshed.`);
       } catch (error) {
         if (errorMessage(error, "").includes("does not exist")) {
           setLibrary((current) => current ? {
@@ -334,6 +402,7 @@ export default function App() {
   }
 
   async function relinkProject(project: Project) {
+    setProjectMenuOpen(false);
     await runExclusive("relink", async () => {
       try {
         const path = await chooseProjectFolder();
@@ -343,7 +412,7 @@ export default function App() {
           ...current,
           projects: replaceProject(current.projects, relinked),
         } : current);
-        setToast(`${relinked.name} has been relinked.`);
+        setToast(`${relinked.name} relinked.`);
       } catch (error) {
         setToast(errorMessage(error, "Could not relink that project."));
       }
@@ -351,13 +420,14 @@ export default function App() {
   }
 
   async function removeProject(project: Project) {
-    if (!window.confirm(`Remove ${project.name} from Launchpad? Its folder will not be deleted.`)) return;
+    setProjectMenuOpen(false);
+    if (!window.confirm(`Remove ${project.name} from Launchpad? Its folder and source files will stay untouched.`)) return;
     await runExclusive("remove", async () => {
       try {
         const nextLibrary = await removeProjectFromLibrary(project.id);
         setLibrary(nextLibrary);
         if (focusEditor?.projectId === project.id) closeFocusEditor();
-        setToast(`${project.name} was removed from Launchpad. Its files are untouched.`);
+        setToast(`${project.name} removed from Launchpad.`);
       } catch (error) {
         setToast(errorMessage(error, "Could not remove that project."));
       }
@@ -396,11 +466,7 @@ export default function App() {
 
   function openFocusEditor() {
     if (!active || isBusy) return;
-    setFocusEditor({
-      projectId: active.id,
-      quest: active.quest,
-      checkpoint: active.checkpoint,
-    });
+    setFocusEditor({ projectId: active.id, quest: active.quest, checkpoint: active.checkpoint });
   }
 
   async function saveFocus() {
@@ -414,7 +480,7 @@ export default function App() {
           projects: replaceProject(current.projects, updated),
         } : current);
         closeFocusEditor();
-        setToast("Focus saved for Future You.");
+        setToast("Focus saved.");
       } catch (error) {
         setToast(errorMessage(error, "Could not save that focus."));
       }
@@ -422,6 +488,7 @@ export default function App() {
   }
 
   async function createBackup() {
+    setAppMenuOpen(false);
     await runExclusive("backup", async () => {
       try {
         const backup = await backupLibrary();
@@ -432,32 +499,73 @@ export default function App() {
     });
   }
 
+  async function exportBackup() {
+    setAppMenuOpen(false);
+    await runExclusive("export", async () => {
+      try {
+        const path = await chooseBackupDestination();
+        if (!path) return;
+        const backup = await exportLibrary(path);
+        setToast(`Backup exported: ${backup.fileName}`);
+      } catch (error) {
+        setToast(errorMessage(error, "Could not export the backup."));
+      }
+    });
+  }
+
+  async function restoreBackup() {
+    setAppMenuOpen(false);
+    await runExclusive("restore", async () => {
+      try {
+        const path = await chooseBackupFile();
+        if (!path) return;
+        if (!window.confirm("Restore this Launchpad backup? A safety backup of the current library will be created first.")) return;
+        const restored = await restoreLibrary(path);
+        setLibrary(restored);
+        setFocusEditor(null);
+        setProjectMenuOpen(false);
+        setToast("Library restored safely.");
+      } catch (error) {
+        setToast(errorMessage(error, "Could not restore that backup."));
+      }
+    });
+  }
+
   const header = (
     <header className="topbar">
-      <div className="brand" aria-label="Launchpad">✦ <span>Launchpad</span></div>
-      <span className="tiny-copy">your little collection of worlds</span>
-      <div className="topbar-tools">
+      <div className="brand" aria-label="Launchpad"><BrandMark /><span>Launchpad</span></div>
+      <div className="app-menu-shell">
         <button
-          className="theme-toggle"
+          className="menu-trigger"
           type="button"
-          aria-label={`Switch to ${theme === "light" ? "dark grey" : "light"} theme`}
-          aria-pressed={theme === "dark"}
-          onClick={() => setTheme((current) => current === "light" ? "dark" : "light")}
+          aria-label="App menu"
+          aria-expanded={appMenuOpen}
+          onClick={() => setAppMenuOpen((open) => !open)}
         >
-          <span aria-hidden="true">{theme === "light" ? "◐" : "☼"}</span>
-          {theme === "light" ? "Dark" : "Light"}
+          •••
         </button>
-        <div className="window-dots" aria-hidden="true"><i /><i /><i /></div>
+        {appMenuOpen && (
+          <div className="popover app-menu" role="menu">
+            <button type="button" role="menuitem" onClick={() => { setTheme((current) => current === "light" ? "dark" : "light"); setAppMenuOpen(false); }}>
+              <span>{theme === "light" ? "Dark appearance" : "Light appearance"}</span><kbd>{theme === "light" ? "◐" : "☼"}</kbd>
+            </button>
+            <div className="menu-rule" />
+            <span className="menu-label">Library</span>
+            <button type="button" role="menuitem" onClick={createBackup} disabled={isBusy}>Back up now</button>
+            <button type="button" role="menuitem" onClick={exportBackup} disabled={isBusy}>Export backup…</button>
+            <button type="button" role="menuitem" onClick={restoreBackup} disabled={isBusy}>Restore backup…</button>
+          </div>
+        )}
       </div>
     </header>
   );
 
   if (!library && !loadError) {
-    return <div className="app-shell">{header}<main className="state-page"><div className="state-card" role="status"><span className="state-glyph">✦</span><h1>Opening your library…</h1><p>Refreshing the project you last used.</p></div></main></div>;
+    return <div className="app-shell">{header}<main className="state-page"><div className="state-card" role="status"><BrandMark /><h1>Opening Launchpad</h1><p>Refreshing your last project.</p></div></main></div>;
   }
 
   if (loadError) {
-    return <div className="app-shell">{header}<main className="state-page"><div className="state-card error-card" role="alert"><span className="state-glyph">!</span><h1>Your library could not open.</h1><p>{loadError}</p><button type="button" onClick={() => { setLibrary(null); setReloadKey((key) => key + 1); }}>Try again</button></div></main></div>;
+    return <div className="app-shell">{header}<main className="state-page"><div className="state-card error-card" role="alert"><span className="state-glyph">!</span><h1>Launchpad could not open.</h1><p>{loadError}</p><button type="button" onClick={() => { setLibrary(null); setReloadKey((key) => key + 1); }}>Try again</button></div></main></div>;
   }
 
   if (!active) {
@@ -465,39 +573,57 @@ export default function App() {
       <div className="app-shell">
         {header}
         <main className="empty-page">
-          <section className="welcome"><div><span className="eyebrow">{dateLabel.toUpperCase()}</span><h1>Good {greeting} <span>🌱</span></h1><p>Your collection is ready for its first real project.</p></div></section>
+          <section className="welcome"><span className="eyebrow">{dateLabel.toUpperCase()}</span><h1>Good {greeting} <span>🌱</span></h1></section>
           <section className="empty-library">
-            <span className="empty-mark">＋</span><span className="eyebrow">START YOUR COLLECTION</span>
-            <h2>Add a project you already care about.</h2>
-            <p>Launchpad will inspect its repository and remember your focus locally.</p>
+            <div className="empty-mark"><BrandMark /></div>
+            <h2>Add your first project.</h2>
+            <p>Choose a local folder. Launchpad will remember the project and where you left off.</p>
             <button type="button" onClick={addProject} disabled={isBusy}>{operation === "add" ? "Opening folders…" : "Choose a project folder"}</button>
           </section>
         </main>
-        <div className="page-footer"><span>Local first. No streaks. No guilt.</span><span>Launchpad v0.1 · Windows-first</span></div>
+        <div className="page-footer"><span>Local-first</span><span>Windows · v0.1</span></div>
         {toast && <div className="toast" role="status">{toast}</div>}
       </div>
     );
   }
-
-  const cleanCount = library!.projects.filter((project) => project.gitStatus === "clean").length;
 
   return (
     <div className="app-shell">
       {header}
       <main>
         <section className="welcome">
-          <div><span className="eyebrow">{dateLabel.toUpperCase()}</span><h1>Good {greeting} <span>🌸</span></h1><p>{active.name} is right where you left it.</p></div>
-          <div className="local-note"><b>⌂</b><span>local library<br />on this device</span></div>
+          <span className="eyebrow">{dateLabel.toUpperCase()}</span>
+          <h1>Good {greeting} <span>🌸</span></h1>
+          <p>{active.name} is right where you left it.</p>
         </section>
 
         <section className="focus-panel">
-          <div className={`focus-art mood-${moodFromName(active.name)}`}>
-            <span className="focus-symbol">{projectSymbol(active.name)}</span>
-            <div><strong>{active.name}</strong><small>{projectTagline(active)}</small></div>
+          <div className="focus-visual">
+            <ProjectArtwork project={active} />
+            <div className="focus-project-name"><strong>{active.name}</strong><span>{projectTagline(active)}</span></div>
           </div>
+
           <div className="focus-copy">
-            <div className="git-line" title={`${active.branch} · ${metadataLabel(active.metadataStatus)}`}><i className={active.gitStatus} /><span className="branch-name">{active.branch}</span><span>·</span>{metadataLabel(active.metadataStatus)}</div>
-            <span className="eyebrow">CURRENT QUEST ✨</span><h2>{active.quest}</h2><p className="checkpoint">“{active.checkpoint}”</p>
+            <div className="focus-topline">
+              <div className="git-line" title={`${active.branch} · ${metadataLabel(active.metadataStatus)}`}>
+                <i className={active.gitStatus} /><span className="branch-name">{active.branch}</span><span>·</span>{metadataLabel(active.metadataStatus)}
+              </div>
+              <div className="project-menu-shell">
+                <button className="menu-trigger small" type="button" aria-label="Project options" aria-expanded={projectMenuOpen} onClick={() => setProjectMenuOpen((open) => !open)}>•••</button>
+                {projectMenuOpen && (
+                  <div className="popover project-menu" role="menu">
+                    <button type="button" role="menuitem" onClick={() => refreshProject(active)} disabled={isBusy || !active.available}>Refresh metadata</button>
+                    <button type="button" role="menuitem" onClick={() => relinkProject(active)} disabled={isBusy}>Relink folder…</button>
+                    <div className="menu-rule" />
+                    <button className="danger" type="button" role="menuitem" onClick={() => removeProject(active)} disabled={isBusy}>Remove from Launchpad</button>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <span className="eyebrow">CURRENT QUEST</span>
+            <h2>{active.quest}</h2>
+            <p className="checkpoint">“{active.checkpoint}”</p>
 
             {active.available ? (
               <div className="focus-actions">
@@ -505,67 +631,51 @@ export default function App() {
                 <button className="terminal" type="button" onClick={launchTerminal} disabled={isBusy} aria-label="Open terminal">{operation === "terminal" ? "…" : ">_"}</button>
               </div>
             ) : (
-              <div className="broken-actions" role="alert"><span>Launchpad cannot find this project folder.</span><button type="button" onClick={() => relinkProject(active)} disabled={isBusy}>Relink folder</button><button type="button" onClick={() => removeProject(active)} disabled={isBusy}>Remove</button></div>
+              <div className="broken-actions" role="alert"><span>Launchpad cannot find this folder.</span><button type="button" onClick={() => relinkProject(active)} disabled={isBusy}>Relink folder</button><button type="button" onClick={() => removeProject(active)} disabled={isBusy}>Remove</button></div>
             )}
 
-            <div className="meta-row">
+            <div className="focus-meta">
               <div><small>SCRIPTS</small><strong title={active.scripts.join(" · ")}>{active.scripts.length ? active.scripts.join(" · ") : "none detected"}</strong></div>
-              <div><small>METADATA</small><strong>{relativeDate(active.metadataRefreshedAt, now)}</strong></div>
-              <button ref={editFocusButtonRef} type="button" onClick={openFocusEditor} disabled={isBusy}>Edit focus 🌱</button>
-            </div>
-            <div className="project-tools">
-              <button type="button" onClick={() => refreshProject(active)} disabled={isBusy || !active.available}>Refresh</button>
-              <button type="button" onClick={() => relinkProject(active)} disabled={isBusy}>Relink</button>
-              <button type="button" onClick={() => removeProject(active)} disabled={isBusy}>Remove</button>
+              <div><small>UPDATED</small><strong>{relativeDate(active.metadataRefreshedAt, now)}</strong></div>
+              <button ref={editFocusButtonRef} type="button" onClick={openFocusEditor} disabled={isBusy}>Edit focus</button>
             </div>
           </div>
         </section>
 
         <section className="collection">
-          <div className="section-head">
-            <div><span className="eyebrow">MY COLLECTION</span><h3>Little worlds, still growing.</h3></div>
-            <div className="library-actions"><button type="button" onClick={createBackup} disabled={isBusy}>Back up</button><button type="button" onClick={addProject} disabled={isBusy}>Add project <span>＋</span></button></div>
-          </div>
+          <div className="section-head"><div><span className="eyebrow">YOUR WORLDS</span><h3>Projects</h3></div><button className="add-project" type="button" onClick={addProject} disabled={isBusy}>Add project <span>＋</span></button></div>
           <div className="shelf">
             {library!.projects.map((project) => (
               <div className="project-cover-wrap" key={project.id}>
                 <button
                   type="button"
-                  className={`project-cover mood-${moodFromName(project.name)} ${project.id === active.id ? "active" : ""} ${!project.available ? "unavailable" : ""}`}
+                  className={`project-cover ${project.id === active.id ? "active" : ""} ${!project.available ? "unavailable" : ""}`}
                   onClick={() => void activateProject(project)}
                   aria-pressed={project.id === active.id}
                   disabled={isBusy || !project.available}
                 >
-                  <span className="cover-symbol">{projectSymbol(project.name)}</span>
-                  <div><strong title={project.name}>{project.name}</strong><small>{projectTagline(project)}</small></div>
+                  <ProjectArtwork project={project} compact />
+                  <div className="cover-copy"><strong title={project.name}>{project.name}</strong><small>{projectTagline(project)}</small></div>
                   <footer><span>{relativeDate(project.lastOpenedAt, now)}</span><span>{project.available ? metadataLabel(project.metadataStatus) : "missing"}</span></footer>
                 </button>
                 {!project.available && <div className="cover-recovery"><button type="button" onClick={() => relinkProject(project)} disabled={isBusy}>Relink</button><button type="button" onClick={() => removeProject(project)} disabled={isBusy}>Remove</button></div>}
               </div>
             ))}
-            <button className="project-cover add-cover" type="button" onClick={addProject} disabled={isBusy}><span className="plus">＋</span><div><strong>Add a local project</strong><small>Choose a folder and let Launchpad inspect it.</small></div></button>
+            <button className="project-cover add-cover" type="button" onClick={addProject} disabled={isBusy}><span className="plus">＋</span><div className="cover-copy"><strong>Add project</strong><small>Choose a local folder</small></div></button>
           </div>
-          <div className="shelf-edge" />
-        </section>
-
-        <section className="today" aria-label="Library summary">
-          <div><span className="eyebrow">YOUR LIBRARY</span><strong>A quiet place to pick up the thread.</strong></div>
-          <div><small>PROJECTS</small><strong>{library!.projects.length}</strong><span>stored locally</span></div>
-          <div><small>READY</small><strong>{cleanCount}</strong><span>clean working trees</span></div>
-          <div className="cat">₍^. .^₎⟆ <span>no scoring, just context</span></div>
         </section>
       </main>
 
-      <div className="page-footer"><span>Local first. No streaks. No guilt.</span><span>Launchpad v0.1 · Windows-first</span></div>
+      <div className="page-footer"><span>Local-first</span><span>Windows · v0.1</span></div>
 
       {focusEditor && (
         <div className="backdrop" onMouseDown={closeFocusEditor}>
           <section ref={focusModalRef} className="checkpoint-modal" role="dialog" aria-modal="true" aria-labelledby="focus-title" onMouseDown={(event) => event.stopPropagation()}>
-            <span className="pin">✦</span><span className="eyebrow">LEAVE A TRAIL 🌱</span><h2 id="focus-title">Where should Future You continue?</h2>
-            <p>A concrete quest and one useful checkpoint make the next five minutes easy.</p>
+            <span className="eyebrow">LEAVE A TRAIL 🌱</span><h2 id="focus-title">Where should Future You continue?</h2>
+            <p>One concrete next step is enough.</p>
             <label>Current quest<input autoFocus maxLength={120} value={focusEditor.quest} onChange={(event) => setFocusEditor({ ...focusEditor, quest: event.target.value })} /></label>
             <label>Checkpoint<textarea maxLength={180} value={focusEditor.checkpoint} onChange={(event) => setFocusEditor({ ...focusEditor, checkpoint: event.target.value })} /></label>
-            <div><button type="button" onClick={closeFocusEditor}>Not now</button><button className="save" type="button" onClick={saveFocus} disabled={isBusy}>{operation === "save" ? "Saving…" : "Save focus ✨"}</button></div>
+            <div><button type="button" onClick={closeFocusEditor}>Cancel</button><button className="save" type="button" onClick={saveFocus} disabled={isBusy}>{operation === "save" ? "Saving…" : "Save focus"}</button></div>
           </section>
         </div>
       )}
