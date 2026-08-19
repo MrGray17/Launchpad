@@ -48,7 +48,7 @@ On Windows, native actions expect Git, VS Code's `code` command, and Windows Ter
 ## Verify it
 
 ```bash
-npm test
+npm run test:coverage
 npm run build
 cargo test --manifest-path src-tauri/Cargo.toml
 cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings

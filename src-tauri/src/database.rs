@@ -320,6 +320,38 @@ pub(crate) fn mark_opened(connection: &Connection, id: i64) -> Result<Project, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    struct TestDatabase {
+        directory: PathBuf,
+        path: PathBuf,
+    }
+
+    impl TestDatabase {
+        fn new(name: &str) -> Self {
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be after the Unix epoch")
+                .as_nanos();
+            let directory = std::env::temp_dir().join(format!(
+                "launchpad-database-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&directory).expect("database test directory should be created");
+            let path = directory.join("launchpad.sqlite3");
+            Self { directory, path }
+        }
+    }
+
+    impl Drop for TestDatabase {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 
     fn snapshot(path: &str) -> ProjectSnapshot {
         ProjectSnapshot {
@@ -379,5 +411,103 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    fn library_survives_closing_and_reopening_the_database() {
+        let storage = TestDatabase::new("reopen");
+        let project_id = {
+            let database = Database::open(&storage.path).unwrap();
+            database
+                .with_connection(|connection| {
+                    let project =
+                        upsert_project(connection, &snapshot("C:\\durable-project"), None, true)?;
+                    update_focus(
+                        connection,
+                        project.id,
+                        "Persist the library",
+                        "Close and reopen the SQLite connection.",
+                    )?;
+                    mark_opened(connection, project.id)?;
+                    Ok(project.id)
+                })
+                .unwrap()
+        };
+
+        let reopened = Database::open(&storage.path).unwrap();
+        let library = reopened
+            .with_connection(|connection| load_library(connection))
+            .unwrap();
+        assert_eq!(library.active_project_id, Some(project_id));
+        assert_eq!(library.projects.len(), 1);
+        assert_eq!(library.projects[0].quest, "Persist the library");
+        assert_eq!(
+            library.projects[0].checkpoint,
+            "Close and reopen the SQLite connection."
+        );
+        assert!(library.projects[0].last_opened_at.is_some());
+    }
+
+    #[test]
+    fn active_project_rejects_unknown_ids_and_can_be_cleared() {
+        let database = Database::in_memory();
+        database
+            .with_connection(|connection| {
+                let project = upsert_project(connection, &snapshot("C:\\repo"), None, true)?;
+                assert!(set_active_project(connection, Some(project.id + 100)).is_err());
+                assert_eq!(
+                    load_library(connection)?.active_project_id,
+                    Some(project.id)
+                );
+                set_active_project(connection, None)?;
+                assert_eq!(load_library(connection)?.active_project_id, None);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn focus_updates_trim_input_and_count_unicode_characters() {
+        let database = Database::in_memory();
+        database
+            .with_connection(|connection| {
+                let project = upsert_project(connection, &snapshot("C:\\repo"), None, true)?;
+                let updated = update_focus(
+                    connection,
+                    project.id,
+                    "  Ship safely  ",
+                    "  Preserve the user's context.  ",
+                )?;
+                assert_eq!(updated.quest, "Ship safely");
+                assert_eq!(updated.checkpoint, "Preserve the user's context.");
+                assert!(update_focus(connection, project.id, &"🌸".repeat(121), "valid").is_err());
+                assert!(update_focus(connection, project.id, "valid", &"🌱".repeat(181)).is_err());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn newer_database_versions_fail_without_mutating_the_file() {
+        let storage = TestDatabase::new("future-version");
+        let connection = Connection::open(&storage.path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+
+        let error = match Database::open(&storage.path) {
+            Ok(_) => panic!("future database versions must be rejected"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error,
+            "This Launchpad library was created by a newer app version."
+        );
+        let connection = Connection::open(&storage.path).unwrap();
+        let version = connection
+            .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
     }
 }

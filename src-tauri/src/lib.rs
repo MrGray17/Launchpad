@@ -23,14 +23,25 @@ pub(crate) struct ProjectSnapshot {
 }
 
 fn read_branch(project_path: &Path) -> String {
-    let head_path = project_path.join(".git").join("HEAD");
-    let Ok(head) = fs::read_to_string(head_path) else {
+    if !project_path.join(".git").exists() {
         return "not-a-git-repo".into();
-    };
-    head.trim()
-        .strip_prefix("ref: refs/heads/")
-        .unwrap_or("detached")
-        .to_string()
+    }
+    match Command::new("git")
+        .arg("-C")
+        .arg(project_path)
+        .args(["symbolic-ref", "--short", "HEAD"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if branch.is_empty() {
+                "detached".into()
+            } else {
+                branch
+            }
+        }
+        _ => "detached".into(),
+    }
 }
 
 fn read_scripts(project_path: &Path) -> Vec<String> {
@@ -356,5 +367,57 @@ mod tests {
         let error = inspect_project_path(missing.to_string_lossy().to_string())
             .expect_err("missing folders should be rejected");
         assert_eq!(error, "That project folder does not exist.");
+    }
+
+    #[test]
+    fn inspect_project_reads_the_branch_from_a_linked_git_worktree() {
+        let repository = TestProject::new("worktree-source");
+        let linked = TestProject::new("worktree-linked");
+        fs::remove_dir(&linked.0).expect("linked worktree target should start absent");
+
+        assert!(Command::new("git")
+            .args(["init", "--quiet"])
+            .arg(&repository.0)
+            .status()
+            .unwrap()
+            .success());
+        fs::write(repository.0.join("README.md"), "worktree fixture")
+            .expect("fixture should be written");
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repository.0)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repository.0)
+            .args([
+                "-c",
+                "user.name=Launchpad Test",
+                "-c",
+                "user.email=launchpad@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "fixture",
+            ])
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("git")
+            .arg("-C")
+            .arg(&repository.0)
+            .args(["worktree", "add", "--quiet", "-b", "feat/linked"])
+            .arg(&linked.0)
+            .status()
+            .unwrap()
+            .success());
+
+        let snapshot = inspect_project_path(linked.0.to_string_lossy().to_string())
+            .expect("linked worktrees should be inspectable");
+        assert_eq!(snapshot.branch, "feat/linked");
+        assert!(linked.0.join(".git").is_file());
     }
 }
