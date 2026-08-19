@@ -38,7 +38,7 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<(String, bo
     let mut statement = connection
         .prepare(pragma)
         .map_err(|error| recovery_error("That backup structure could not be verified.", error))?;
-    statement
+    let columns = statement
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(1)?,
@@ -48,7 +48,8 @@ fn table_columns(connection: &Connection, table: &str) -> Result<Vec<(String, bo
         })
         .map_err(|error| recovery_error("That backup structure could not be verified.", error))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| recovery_error("That backup structure could not be verified.", error))
+        .map_err(|error| recovery_error("That backup structure could not be verified.", error))?;
+    Ok(columns)
 }
 
 fn validate_table_shapes(connection: &Connection) -> Result<(), String> {
