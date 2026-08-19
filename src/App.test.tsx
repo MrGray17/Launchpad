@@ -234,12 +234,13 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(localStorage.getItem(LEGACY_ACTIVE_KEY)).toBe("offline");
   });
 
-  it("leaves malformed prototype data untouched for manual recovery", async () => {
+  it("keeps malformed prototype data non-blocking and untouched", async () => {
     localStorage.setItem(LEGACY_PROJECTS_KEY, "{not-json");
     render(<App />);
-    expect((await screen.findByRole("alert")).textContent).toContain("left it untouched");
+    expect(await screen.findByRole("button", { name: /Continue Rate Limiter/ })).toBeTruthy();
+    expect((await screen.findByRole("status")).textContent).toContain("left it untouched");
     expect(localStorage.getItem(LEGACY_PROJECTS_KEY)).toBe("{not-json");
-    expect(desktop.bootstrapLibrary).not.toHaveBeenCalled();
+    expect(desktop.bootstrapLibrary).toHaveBeenCalledWith([], null);
   });
 
   it("creates, exports, and restores backups through native recovery commands", async () => {
