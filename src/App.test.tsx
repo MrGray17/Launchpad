@@ -170,14 +170,22 @@ describe("Launchpad hardened project lifecycle", () => {
     expect(screen.getByRole("menuitem", { name: "Remove from Launchpad" })).toBeTruthy();
   });
 
-  it("refreshes metadata and promotes recovery controls only when a folder is missing", async () => {
-    desktop.refreshProject.mockRejectedValue("That project folder does not exist.");
+  it("rehydrates authoritative availability after refresh failure without parsing error text", async () => {
+    const missing = { ...project, available: false };
+    desktop.bootstrapLibrary
+      .mockResolvedValueOnce(bootstrap)
+      .mockResolvedValueOnce({ ...bootstrap, projects: [missing] });
+    desktop.refreshProject.mockRejectedValue("Opaque native refresh failure.");
+
     render(<App />);
     await screen.findByRole("button", { name: /Continue Rate Limiter/ });
     openProjectMenu();
     fireEvent.click(screen.getByRole("menuitem", { name: "Refresh metadata" }));
+
     expect((await screen.findByRole("alert")).textContent).toContain("cannot find");
     expect(screen.getByRole("button", { name: "Relink folder" })).toBeTruthy();
+    expect(desktop.bootstrapLibrary).toHaveBeenCalledTimes(2);
+    expect((await screen.findByRole("status")).textContent).toContain("Opaque native refresh failure");
   });
 
   it("relinks a missing project without exposing its old path", async () => {
