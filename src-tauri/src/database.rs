@@ -1,5 +1,7 @@
 use crate::inspection::ProjectSnapshot;
-use rusqlite::{ffi::ErrorCode, params, Connection, OptionalExtension, Row, MAIN_DB};
+use rusqlite::{
+    ffi::ErrorCode, params, types::Type, Connection, OptionalExtension, Row, MAIN_DB,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -241,6 +243,9 @@ fn migrate(connection: &mut Connection) -> Result<(), String> {
 fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     let path = row.get::<_, String>(2)?;
     let scripts_json = row.get::<_, String>(6)?;
+    let scripts = serde_json::from_str(&scripts_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(6, Type::Text, Box::new(error))
+    })?;
     Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -250,7 +255,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
         branch: row.get(3)?,
         git_status: row.get(4)?,
         metadata_status: row.get(5)?,
-        scripts: serde_json::from_str(&scripts_json).unwrap_or_default(),
+        scripts,
         quest: row.get(7)?,
         checkpoint: row.get(8)?,
         created_at: row.get(9)?,
@@ -704,6 +709,26 @@ mod tests {
                 assert_eq!(original.id, duplicate.id);
                 assert_eq!(duplicate.quest, "Ship safely");
                 assert_eq!(load_library(connection)?.projects.len(), 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn malformed_scripts_json_is_not_silently_discarded() {
+        let database = Database::in_memory();
+        database
+            .with_connection(|connection| {
+                let project = upsert_project(connection, &snapshot("C:\\corrupt"), None, true)?;
+                connection
+                    .execute(
+                        "UPDATE projects SET scripts_json = 'not-json' WHERE id = ?1",
+                        [project.id],
+                    )
+                    .map_err(database_error)?;
+
+                assert!(load_library(connection).is_err());
+                assert!(project_by_id(connection, project.id).is_err());
                 Ok(())
             })
             .unwrap();
