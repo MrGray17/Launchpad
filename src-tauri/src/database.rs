@@ -1,7 +1,5 @@
 use crate::inspection::ProjectSnapshot;
-use rusqlite::{
-    ffi::ErrorCode, params, types::Type, Connection, OptionalExtension, Row, MAIN_DB,
-};
+use rusqlite::{ffi::ErrorCode, params, types::Type, Connection, OptionalExtension, Row, MAIN_DB};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
