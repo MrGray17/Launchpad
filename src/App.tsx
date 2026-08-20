@@ -410,11 +410,11 @@ export default function App() {
         } : current);
         setToast(`${refreshed.name} refreshed.`);
       } catch (error) {
-        if (errorMessage(error, "").includes("does not exist")) {
-          setLibrary((current) => current ? {
-            ...current,
-            projects: current.projects.map((item) => item.id === project.id ? { ...item, available: false } : item),
-          } : current);
+        try {
+          const state = await bootstrapApp();
+          setLibrary({ projects: state.projects, activeProjectId: state.activeProjectId });
+        } catch {
+          // Keep the last known library state; the original refresh error stays visible.
         }
         setToast(errorMessage(error, "Could not refresh that project."));
       }
